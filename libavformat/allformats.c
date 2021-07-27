@@ -473,6 +473,7 @@ extern const AVInputFormat  ff_webm_dash_manifest_demuxer;
 extern const AVOutputFormat ff_webm_dash_manifest_muxer;
 extern const AVOutputFormat ff_webm_chunk_muxer;
 extern const AVOutputFormat ff_webp_muxer;
+extern const AVInputFormat  ff_webrtc_stream_demuxer;
 extern const AVInputFormat  ff_webvtt_demuxer;
 extern const AVOutputFormat ff_webvtt_muxer;
 extern const AVInputFormat  ff_wsaud_demuxer;
