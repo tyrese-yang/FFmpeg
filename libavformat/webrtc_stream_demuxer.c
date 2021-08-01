@@ -844,6 +844,7 @@ static int webrtc_connect(AVFormatContext *s, const Candidate *candidate, const 
     msg->msg_method = STUN_METHOD_BINDING; 
     msg->ice_controlling = 1;
     msg->priority = 1;
+    msg->use_candidate = 1;
     memcpy(msg->credentials.username, username, strlen(username));
     for (int i = 0; i < sizeof(msg->transaction_id); i++) {
         msg->transaction_id[i] = i;
