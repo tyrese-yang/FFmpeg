@@ -17,6 +17,9 @@
 #define STUN_BINDING_PASSWORD "ffmpeg"
 #define LOCAL_ICE_UFRAG "ffmpeg"
 
+#define DTS_EXTMAP 10
+#define CTS_EXTMAP 18
+
 const char *SDP_STR = "v=0\r\n"
     "o=- 4081582919824265660 2 IN IP4 127.0.0.1\r\n"
     "s=-\r\n"
@@ -744,15 +747,15 @@ static void *read_rtp_thread(void *arg)
                             i++;
                             continue;
                         }
-                        int id = (buf[pos+i] > 4) & 0x0f;
+                        int id = (buf[pos+i] >> 4) & 0x0f;
                         int l = buf[pos+i] & 0x0f;
                         switch (id) {
-                        case 10:
+                        case DTS_EXTMAP:
                             for (int j = 0; j < l+1; j++) {
                                 dts = (buf[pos+i+1+j] << (8 * (l-j))) | dts;
                             }
                             break;
-                        case 18:
+                        case CTS_EXTMAP:
                             for (int j = 0; j < l+1; j++) {
                                 cts = (buf[pos+i+1+j] << (8 * (l-j))) | cts;
                             }
@@ -772,12 +775,12 @@ static void *read_rtp_thread(void *arg)
                         int id = buf[pos+i];
                         int l = buf[pos+i+1];
                         switch (id) {
-                        case 10:
+                        case DTS_EXTMAP:
                             for (int j = 0; j < l; j++) {
                                 dts = (buf[pos+i+2+j] << (8 * (l-j-1))) | dts;
                             }
                             break;
-                        case 18:
+                        case CTS_EXTMAP:
                             for (int j = 0; j < l; j++) {
                                 cts = (buf[pos+i+2+j] << (8 * (l-j-1))) | cts;
                             }
