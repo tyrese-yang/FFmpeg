@@ -678,9 +678,11 @@ static int handle_video_payload(AVFormatContext *ctx, AVPacket **unfinished_pkt,
     AVPacket *pkt = *unfinished_pkt;
 
     switch (type) {
-    case 0:                    // undefined, but pass them through
+    case 0:             // undefined, but pass them through
     case 1:
-    case 31: // private type
+    case 7:             // SPS
+    case 8:             // PPS
+    case 31:            // private type
         if ((result = av_new_packet(pkt, len + sizeof(start_sequence))) < 0)
             return result;
         pkt->dts = dts;
