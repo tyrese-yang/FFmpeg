@@ -10,6 +10,7 @@
 #include "libavformat/internal.h"
 #include "libavutil/avutil.h"
 #include "libavutil/intreadwrite.h"
+#include "libavcodec/get_bits.h"
 
 #include "webrtc_stream.h"
 
@@ -864,6 +865,44 @@ static int webrtc_connect(AVFormatContext *s, const Candidate *candidate, const 
     return 0;
 }
 
+static int parse_fmtp_config(AVStream *st, const char *value)
+{
+    int len = ff_hex_to_data(NULL, value), i, ret = 0;
+    GetBitContext gb;
+    uint8_t *config;
+    int audio_mux_version, same_time_framing, num_programs, num_layers;
+
+    /* Pad this buffer, too, to avoid out of bounds reads with get_bits below */
+    config = av_mallocz(len + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!config)
+        return AVERROR(ENOMEM);
+    ff_hex_to_data(config, value);
+    init_get_bits(&gb, config, len*8);
+    audio_mux_version = get_bits(&gb, 1);
+    same_time_framing = get_bits(&gb, 1);
+    skip_bits(&gb, 6); /* num_sub_frames */
+    num_programs      = get_bits(&gb, 4);
+    num_layers        = get_bits(&gb, 3);
+    if (audio_mux_version != 0 || same_time_framing != 1 || num_programs != 0 ||
+        num_layers != 0) {
+        avpriv_report_missing_feature(NULL, "LATM config (%d,%d,%d,%d)",
+                                      audio_mux_version, same_time_framing,
+                                      num_programs, num_layers);
+        ret = AVERROR_PATCHWELCOME;
+        goto end;
+    }
+    ret = ff_alloc_extradata(st->codecpar, (get_bits_left(&gb) + 7)/8);
+    if (ret < 0) {
+        goto end;
+    }
+    for (i = 0; i < st->codecpar->extradata_size; i++)
+        st->codecpar->extradata[i] = get_bits(&gb, 8);
+
+end:
+    av_free(config);
+    return ret;
+}
+
 static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
 {
     for (int i = 0; i < sdp->nb_medias; i++) {
@@ -877,10 +916,7 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             st->codecpar->codec_id = AV_CODEC_ID_AAC;
             st->codecpar->channels = m->channel;
             st->codecpar->sample_rate = m->sample_rate;
-            /* decode the hexa encoded parameter */
-            int len = ff_hex_to_data(NULL, m->config);
-            ff_alloc_extradata(st->codecpar, len);
-            ff_hex_to_data(st->codecpar->extradata, m->config);
+            parse_fmtp_config(st, m->config);
             // avpriv_set_pts_info(st, 32, 1, st->codecpar->sample_rate);
             avpriv_set_pts_info(st, 32, 1, 1000);
 
