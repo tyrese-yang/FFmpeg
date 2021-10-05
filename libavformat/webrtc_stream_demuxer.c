@@ -954,6 +954,11 @@ static int webrtc_stream_read_header(AVFormatContext *s)
     c->s = s;
     int n = 0;
 
+    if (c->api == NULL) {
+        av_log(s, AV_LOG_ERROR, "Webrtc api must be specified\n");
+        return -1;
+    }
+
     if ((n = send_offer(s, c->api, answer_buf, sizeof(answer_buf))) != 0) {
         return -1;
     }
