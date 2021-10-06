@@ -129,7 +129,7 @@ static RTPMedia *rtp_media_create(SDP *sdp)
     av_log(NULL, AV_LOG_DEBUG, "m=%p n=%d\n", sdp->medias, sdp->nb_medias + 1);
     RTPMedia **medias = av_realloc_array(sdp->medias, sdp->nb_medias + 1, sizeof(*medias));
     sdp->medias = medias;
-    RTPMedia *m = av_malloc(sizeof(RTPMedia));
+    RTPMedia *m = av_mallocz(sizeof(RTPMedia));
     sdp->medias[sdp->nb_medias++] = m;
     return m;
 }
@@ -844,7 +844,7 @@ static int webrtc_connect(AVFormatContext *s, const Candidate *candidate, const 
     pthread_create(&ctx->thread, NULL, read_rtp_thread, ctx);
 
     uint8_t buf[256] = {0};
-    stun_message_t *msg = av_malloc(sizeof(stun_message_t));
+    stun_message_t *msg = av_mallocz(sizeof(stun_message_t));
     memset(msg, 0, sizeof(stun_message_t));
     msg->msg_class = STUN_CLASS_REQUEST;
     msg->msg_method = STUN_METHOD_BINDING; 
@@ -969,7 +969,7 @@ static int webrtc_stream_read_header(AVFormatContext *s)
     }
 
     create_streams_from_sdp(s, &answer.sdp);
-    c->answer_sdp = av_malloc(sizeof(SDP));
+    c->answer_sdp = av_mallocz(sizeof(SDP));
     memcpy(c->answer_sdp, &answer.sdp, sizeof(SDP));
 
     char username[128] = {0};
