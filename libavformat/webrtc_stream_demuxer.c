@@ -11,6 +11,7 @@
 #include "libavutil/avutil.h"
 #include "libavutil/intreadwrite.h"
 #include "libavcodec/get_bits.h"
+#include "libavcodec/h264.h"
 
 #include "webrtc_stream.h"
 
@@ -572,6 +573,8 @@ static int h264_handle_packet_fu_a(AVFormatContext *ctx, void *data, AVPacket *p
         memcpy(pkt->data + pos, buf, len);
         pkt->dts = dts;
         pkt->pts = dts + cts;
+        if (nal_type == H264_NAL_IDR_SLICE)
+            pkt->flags |= AV_PKT_FLAG_KEY;
     } else {
         pos = pkt->size;
         if ((ret = av_grow_packet(pkt, len)) < 0)
@@ -688,6 +691,7 @@ static int handle_video_payload(AVFormatContext *ctx, AVPacket **unfinished_pkt,
             return result;
         pkt->dts = dts;
         pkt->pts = dts + cts;
+        pkt->flags |= AV_PKT_FLAG_KEY;
         memcpy(pkt->data, start_sequence, sizeof(start_sequence));
         memcpy(pkt->data + sizeof(start_sequence), buf, len);
         break;
@@ -806,6 +810,7 @@ static void *read_rtp_thread(void *arg)
                     handle_audio_payload(ctx->s, &pkt, payload, payload_size);
                     pkt->dts = dts;
                     pkt->pts = dts+cts;
+                    pkt->flags |= AV_PKT_FLAG_KEY;
                 } else if (m->type == AVMEDIA_TYPE_VIDEO) {
                     if (handle_video_payload(ctx->s, &ctx->unfinished_pkt, payload, payload_size, dts, cts) == 0) {
                         pkt = ctx->unfinished_pkt;
