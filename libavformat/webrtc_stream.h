@@ -71,13 +71,12 @@ typedef struct WebrtcStreamContext {
     AVFormatContext *s;
 
     char *api;
-    char *offer_file;
+    Answer *answer;
 
     URLContext *rtp_hd;
     pthread_t thread;
     AVPacketQueue queue;
     AVStream *stream_index[256];
-    SDP *answer_sdp;
     AVPacket *unfinished_pkt;
 
     stun_message_t *stun_bind_req;

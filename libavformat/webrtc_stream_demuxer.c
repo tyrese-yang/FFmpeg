@@ -22,8 +22,8 @@
 #define DTS_EXTMAP 10
 #define CTS_EXTMAP 18
 
-const char *SDP_STR = "v=0\r\n"
-    "o=- 4081582919824265660 2 IN IP4 127.0.0.1\r\n"
+const char *OFFER_SDP = "v=0\r\n"
+    "o=- 0 2 IN IP4 127.0.0.1\r\n"
     "s=-\r\n"
     "i=ffmpeg\r\n"
     "t=0 0\r\n"
@@ -82,22 +82,22 @@ const char *SDP_STR = "v=0\r\n"
     "a=rtcp-mux\r\n"
     "a=rtcp-rsize\r\n"
     "a=rtpmap:96 H264/90000\r\n"
-    "a=rtcp-fb:96 goog-remb\r\n"
-    "a=rtcp-fb:96 transport-cc\r\n"
-    "a=rtcp-fb:96 ccm fir\r\n"
-    "a=rtcp-fb:96 nack\r\n"
-    "a=rtcp-fb:96 nack pli\r\n"
-    "a=rtcp-fb:96 rrtr\r\n"
+    // "a=rtcp-fb:96 goog-remb\r\n"
+    // "a=rtcp-fb:96 transport-cc\r\n"
+    // "a=rtcp-fb:96 ccm fir\r\n"
+    // "a=rtcp-fb:96 nack\r\n"
+    // "a=rtcp-fb:96 nack pli\r\n"
+    // "a=rtcp-fb:96 rrtr\r\n"
     "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n"
     "a=rtpmap:97 rtx/90000\r\n"
     "a=fmtp:97 apt=96\r\n"
     "a=rtpmap:98 H264/90000\r\n"
-    "a=rtcp-fb:98 goog-remb\r\n"
-    "a=rtcp-fb:98 transport-cc\r\n"
-    "a=rtcp-fb:98 ccm fir\r\n"
-    "a=rtcp-fb:98 nack\r\n"
-    "a=rtcp-fb:98 nack pli\r\n"
-    "a=rtcp-fb:98 rrtr\r\n"
+    // "a=rtcp-fb:98 goog-remb\r\n"
+    // "a=rtcp-fb:98 transport-cc\r\n"
+    // "a=rtcp-fb:98 ccm fir\r\n"
+    // "a=rtcp-fb:98 nack\r\n"
+    // "a=rtcp-fb:98 nack pli\r\n"
+    // "a=rtcp-fb:98 rrtr\r\n"
     "a=fmtp:98 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
     "a=rtpmap:99 rtx/90000\r\n"
     "a=fmtp:99 apt=98\r\n"
@@ -180,7 +180,7 @@ static int queue_put(AVPacketQueue *q, AVPacket *pkt)
         return -1;
     }
 
-    pkt1 = (PacketList *)av_malloc(sizeof(PacketList));
+    pkt1 = (PacketList *)av_mallocz(sizeof(PacketList));
     if (!pkt1) {
         av_packet_unref(pkt);
         return -1;
@@ -237,18 +237,8 @@ static int queue_get(AVPacketQueue *q, AVPacket *pkt, int block)
     return ret;
 }
 
-static int read_file(const char *filename, uint8_t *buf, int size)
-{
-    FILE *f = fopen(filename, "r");
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    int n = fread(buf, 1, fsize, f);
-    fclose(f);
-    return n;
-}
-
-static int send_offer(AVFormatContext *s, const char* uri, uint8_t *answer, int answer_size)
+static int send_offer(URLContext **puc, AVFormatContext *s, const char* api,
+                      const char *offer)
 {
     uint8_t buf[16*1024] = {0};
     const char *fmt = "{\"clientinfo\":\"ffmpeg\","
@@ -258,54 +248,43 @@ static int send_offer(AVFormatContext *s, const char* uri, uint8_t *answer, int 
                             "\"type\":\"offer\","
                             "\"sdp\":\"%s\""
                         "}}";
-    sprintf(buf, fmt, s->url, SDP_STR);
+    sprintf(buf, fmt, s->url, offer);
 
-    URLContext *h = NULL;
-    ffurl_alloc(&h, uri, AVIO_FLAG_READ_WRITE, NULL);
-    av_opt_set_bin(h->priv_data, "post_data", buf, strlen(buf), 0);
-
-    av_log(s, AV_LOG_INFO, "send offer %s to %s\n", buf, uri);
-
-    ffurl_connect(h, NULL);
-    int n = 0;
-    while (n < answer_size) {
-        int ret = ffurl_read(h, answer+n, answer_size-n);
-        if (ret <= 0) {
-            break;
-        }
-        n += ret;
-    }
-
-    ffurl_close(h);
-    return 0;
+    ffurl_alloc(puc, api, AVIO_FLAG_READ_WRITE, NULL);
+    av_opt_set_bin((*puc)->priv_data, "post_data", buf, strlen(buf), 0);
+    return ffurl_connect(*puc, NULL);
 }
 
-static char *read_line_arg(const char *data, const char *split, char *buf)
+static char *read_line_arg(char *buf, int buf_size, const char *data, const char *split)
 {
     char *next = av_stristr(data, split);
     if (buf) {
         if (next)
-            memcpy(buf, data, next - data);
+            memcpy(buf, data, next - data > buf_size ? buf_size : next - data);
         else
-            strcpy(buf, data);
+            strncpy(buf, data, buf_size);
     }
     return next ? next + 1 : NULL;
 }
 
-static int parse_attr(const char *line, int len, SDP *sdp)
+static int parse_attr(SDP *sdp, const char *data, int len)
 {
     char *v = NULL;
-    if (av_strstart(line, "a=ice-ufrag:", &v)) {
+    char line[1024] = {0};
+    char buf[128] = {0};
+
+    memcpy(line, data, len);
+
+    if (av_strstart(line, "ice-ufrag:", &v)) {
         memcpy(sdp->ice_ufrag, v, len - (v - line));
-    } else if (av_strstart(line, "a=candidate:", &v)) {
+    } else if (av_strstart(line, "candidate:", &v)) {
         // a=candidate:foundation 1 udp 100 27.159.95.33 8000 typ srflx raddr 27.159.95.33 rport 8000 generation 0
-        // TODO: do not use sscanf
-        sscanf(v, "%*s %*d %*s %*d %s %d %*s", sdp->candidate.ip, &sdp->candidate.port);
-    } else if (av_strstart(line, "a=fmtp:", &v)) {
+        // TODO: support multi candidate
+        if (strlen(sdp->candidate.ip) == 0)
+            sscanf(v, "%*s %*d %*s %*d %s %d %*s", sdp->candidate.ip, &sdp->candidate.port);
+    } else if (av_strstart(line, "fmtp:", &v)) {
         // a=fmtp:123 PS-enabled=0;SBR-enabled=0;config=40002420adca1fe0;cpresent=0;object=2;profile-level-id=1;stereo=1
-        int l = 0;
-        l = av_stristr(v, " ") - v;
-        char buf[128] = {0};
+        int l = av_stristr(v, " ") - v;
         memcpy(buf, v, l);
         int id = atoi(buf);
         RTPMedia *m = get_media(sdp, id);
@@ -314,9 +293,9 @@ static int parse_attr(const char *line, int len, SDP *sdp)
             case AVMEDIA_TYPE_AUDIO: {
                 v += l + 1;
                 char *next = v;
-                while(1) {
+                while(next) {
                     memset(buf, 0, sizeof(buf));
-                    next = read_line_arg(next, ";", buf);
+                    next = read_line_arg(buf, sizeof(buf), next, ";");
                     char *vv;
                     if (av_stristart(buf, "PS-enabled=", &vv)) {
                         m->ps = atoi(vv);
@@ -329,18 +308,15 @@ static int parse_attr(const char *line, int len, SDP *sdp)
                     } else if (av_stristart(buf, "profile-level-id=", &vv)) {
                         m->audio_pl_id = atoi(vv);
                     }
-                    if (!next) {
-                        break;
-                    }
                 }
                 break;
             }
             case AVMEDIA_TYPE_VIDEO:{
                 v += l + 1;
                 char *next = v;
-                while(1) {
+                while(next) {
                     memset(buf, 0, sizeof(buf));
-                    next = read_line_arg(next, ";", buf);
+                    next = read_line_arg(buf, sizeof(buf), next, ";");
                     char *vv;
                     if (av_stristart(buf, "bframe-enabled=", &vv)) {
                         m->bframe_enabled = atoi(vv);
@@ -351,9 +327,6 @@ static int parse_attr(const char *line, int len, SDP *sdp)
                     } else if (av_stristart(buf, "profile-level-id=", &vv)) {
                         memcpy(m->video_pl_id, vv, strlen(vv));
                     }
-                    if (!next) {
-                        break;
-                    }
                 }
                 av_log(NULL, AV_LOG_DEBUG, "bf=%d laa=%d pli=%s\n", m->bframe_enabled, m->level_asymmetry_allowed, m->video_pl_id);
                 break;
@@ -362,11 +335,10 @@ static int parse_attr(const char *line, int len, SDP *sdp)
                 break;
             }
         }
-    } else if (av_strstart(line, "a=rtpmap:", &v)) {
+    } else if (av_strstart(line, "rtpmap:", &v)) {
         // a=rtpmap:123 MP4A-ADTS/44100/2
         int l = 0;
         l = av_stristr(v, " ") - v;
-        char buf[128] = {0};
         memcpy(buf, v, l);
         int id = atoi(buf);
         RTPMedia *m = get_media(sdp, id);
@@ -400,102 +372,114 @@ static int parse_attr(const char *line, int len, SDP *sdp)
             }
         }
     }
+
     return 0;
 }
 
-static int parse_mline(const char *line, int len, SDP *sdp)
+static int parse_mline(SDP *sdp, const char *data, int len)
 {
-    if (av_strstart(line, "m=audio", NULL)) {
+    char line[1024] = {0};
+    memcpy(line, data, len);
+
+    if (av_strstart(line, "audio", NULL)) {
         // m=audio 1 RTP/AVPF 123
-        char *next = read_line_arg(line, " ", NULL);
+        char *next = read_line_arg(NULL, 0, line, " ");
         if (next)
-            next = read_line_arg(next, " ", NULL);
+            next = read_line_arg(NULL, 0, next, " ");
         if (next)
-            next = read_line_arg(next, " ", NULL);
+            next = read_line_arg(NULL, 0, next, " ");
         while (next) {
             char buf[8] = {0};
-            next = read_line_arg(next, " ", buf);
+            next = read_line_arg(buf, sizeof(buf), next, " ");
             RTPMedia *m = rtp_media_create(sdp);
             m->id = atoi(buf);
             m->type = AVMEDIA_TYPE_AUDIO;
         }
-    } else if (av_strstart(line, "m=video", NULL)) {
-        char *next = read_line_arg(line, " ", NULL);
+    } else if (av_strstart(line, "video", NULL)) {
+        char *next = read_line_arg(NULL, 0, line, " ");
         if (next)
-            next = read_line_arg(next, " ", NULL);
+            next = read_line_arg(NULL, 0, next, " ");
         if (next)
-            next = read_line_arg(next, " ", NULL);
+            next = read_line_arg(NULL, 0, next, " ");
         while (next) {
             char buf[8] = {0};
-            next = read_line_arg(next, " ", buf);
+            next = read_line_arg(buf, sizeof(buf), next, " ");
             RTPMedia *m = rtp_media_create(sdp);
             m->id = atoi(buf);
             m->type = AVMEDIA_TYPE_VIDEO;
         }
     }
+
     return 0;
 }
 
-static int parse_line(const char *line, int len, SDP *sdp)
+static int parse_line(SDP *sdp, const char *line, int len)
 {
-    char buf[256] = {0};
-    memcpy(buf, line, len);
-    av_log(NULL, AV_LOG_DEBUG, "parse line %s\n", buf);
+    av_log(NULL, AV_LOG_DEBUG, "parse line %.*s\n", len, line);
+
     switch(line[0]) {
     case 'a':
-        return parse_attr(buf, len, sdp);
+        return parse_attr(sdp, line+2, len-2);
     case 'm':
-        return parse_mline(buf, len, sdp);
+        return parse_mline(sdp, line+2, len-2);
     default:
         return 0;
     }
     return 0;
 }
 
-static int parse_sdp(const char *data, int size, SDP *sdp)
+static int parse_sdp(SDP *sdp, const char *data, int size)
 {
     char *pos = data;
     char *line_end = NULL;
     int len = 0;
-    if ((line_end = av_stristr(pos, "\\r"))
-        || (line_end = av_stristr(pos, "\\n"))
-        || (line_end = av_stristr(pos, "\r"))
-        || (line_end = av_stristr(pos, "\n"))) {
 
-        len = line_end ? line_end - pos : size;
-    }
-    // av_log(NULL, AV_LOG_INFO, "pos:%p, len:%d\n", pos, len);
-    while (1 && len > 0) {
-        if (parse_line(pos, len, sdp) < 0) {
-            return -1;
-        }
-        // next line
-        pos += len;
-        char *eq = strchr(pos, '=');
-        if (!eq) {
-            break;
-        }
-        pos = eq - 1;
-        len = 0;
-         if ((line_end = av_stristr(pos, "\\r"))
+    for (;;) {
+        if ((line_end = av_stristr(pos, "\\r"))
             || (line_end = av_stristr(pos, "\\n"))
             || (line_end = av_stristr(pos, "\r"))
             || (line_end = av_stristr(pos, "\n"))) {
 
             len = line_end ? line_end - pos : size;
+        } else {
+            break;
+        }
+
+        if (parse_line(sdp, pos, len) < 0) {
+            return AVERROR_INVALIDDATA;
+        }
+
+        pos += len;
+        for (;;) {
+            if (*pos == '\r' || *pos == '\n') {
+                pos++;
+            } else if (*pos == '\\'
+                       && (*(pos+1) == 'r' || *(pos+1) == 'n')) {
+                pos += 2;
+            } else {
+                break;
+            }
+        }
+
+        if (pos - data >= size) {
+            break;
         }
     }
     return 0;
 }
 
-static int parse_answer(const char *data, int size, Answer *answer)
+static int parse_answer(Answer *answer, const char *data)
 {
+    char *end;
     char *pos = av_stristr(data, "\"sdp\":");
-    pos+=strlen("\"sdp\":");
-    pos = av_stristr(pos, "\"");
-    pos+=1;
-    parse_sdp(pos, size - (pos - data), &answer->sdp);
-    return 0;
+    if (!pos) {
+        return AVERROR_INVALIDDATA;
+    }
+
+    pos += strlen("\"sdp\":");
+    pos = av_stristr(pos, "\"") + 1;
+    end = av_stristr(pos, "\"");
+    return parse_sdp(&answer->sdp, pos, end - pos);
 }
 
 static int is_rtp(const char *data, int size)
@@ -656,7 +640,6 @@ static int handle_audio_payload(AVFormatContext *s, AVPacket **pkt, const uint8_
     return 0;
 }
 
-// return 0 is finished packet
 static int handle_video_payload(AVFormatContext *ctx, AVPacket **unfinished_pkt,
                                 const uint8_t *buf, int len, uint32_t dts, uint32_t cts)
 {
@@ -801,7 +784,7 @@ static void *read_rtp_thread(void *arg)
                 }
             }
 
-            RTPMedia *m = get_media(ctx->answer_sdp, pt);
+            RTPMedia *m = get_media(&ctx->answer->sdp, pt);
             if (m) {
                 int payload_size = size - pos;
                 AVPacket *pkt = NULL;
@@ -838,19 +821,25 @@ static int webrtc_connect(AVFormatContext *s, const Candidate *candidate, const 
 {
     WebrtcStreamContext *ctx = s->priv_data;
     URLContext *h = NULL;
+    uint8_t buf[256] = {0};
+    stun_message_t *msg = av_mallocz(sizeof(stun_message_t));
     char url[256] = {0};
-    ff_url_join(url, sizeof(url), "udp", NULL, candidate->ip, candidate->port, "?localport=65510&fifo_size=0");
-    av_log(s, AV_LOG_INFO, "webrtc connect %s, username = %s\n", url, username);
-    int ret = ffurl_open_whitelist(&h, url,
-                    AVIO_FLAG_READ_WRITE, NULL, NULL, s->protocol_whitelist, s->protocol_blacklist, NULL);
+    int ret = 0;
+
+    ff_url_join(url, sizeof(url), "udp", NULL, candidate->ip,
+                candidate->port, "?localport=65510&fifo_size=0");
+    av_log(s, AV_LOG_INFO, "Webrtc connect to %s, username = %s\n", url, username);
+    if ((ret = ffurl_open_whitelist(&h, url, AVIO_FLAG_READ_WRITE,
+                                    NULL, NULL, s->protocol_whitelist,
+                                    s->protocol_blacklist, NULL)) < 0) {
+        av_log(s, AV_LOG_ERROR, "Cannot open connection");
+        return ret;
+    }
     ctx->rtp_hd = h;
 
     queue_init(s, &ctx->queue);
     pthread_create(&ctx->thread, NULL, read_rtp_thread, ctx);
 
-    uint8_t buf[256] = {0};
-    stun_message_t *msg = av_mallocz(sizeof(stun_message_t));
-    memset(msg, 0, sizeof(stun_message_t));
     msg->msg_class = STUN_CLASS_REQUEST;
     msg->msg_method = STUN_METHOD_BINDING; 
     msg->ice_controlling = 1;
@@ -860,12 +849,17 @@ static int webrtc_connect(AVFormatContext *s, const Candidate *candidate, const 
     for (int i = 0; i < sizeof(msg->transaction_id); i++) {
         msg->transaction_id[i] = i;
     }
-    ret = stun_write(buf, 256, msg, STUN_BINDING_PASSWORD);
+
+    if ((ret = stun_write(buf, sizeof(buf), msg, STUN_BINDING_PASSWORD)) < 0) {
+        av_log(s, AV_LOG_ERROR, "Failed to make stun message");
+        return AVERROR_UNKNOWN;
+    }
+
     ctx->stun_bind_req = msg;
     ctx->last_bind_req_time = av_gettime();
-    ret = ffurl_write(h, buf, ret);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "webrtc connect candidate failed, %s\n", ret, av_err2str(ret));
+    if ((ret = ffurl_write(h, buf, ret)) < 0) {
+        av_log(s, AV_LOG_ERROR, "Webrtc connect candidate failed, %s\n", av_err2str(ret));
+        return ret;
     }
     return 0;
 }
@@ -926,7 +920,7 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             avpriv_set_pts_info(st, 32, 1, 1000);
 
             ctx->stream_index[m->id] = st;
-            av_log(s, AV_LOG_DEBUG, "media channels=%d sample_rate=%d extradata=%s extradata_size=%d\n",
+            av_log(s, AV_LOG_DEBUG, "Media channels=%d sample_rate=%d extradata=%s extradata_size=%d\n",
                 st->codecpar->channels, st->codecpar->sample_rate,
                 st->codecpar->extradata, st->codecpar->extradata_size);
             break;
@@ -950,40 +944,54 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
 
 static int webrtc_stream_read_header(AVFormatContext *s)
 {
-    Answer answer;
-    memset(&answer, 0, sizeof(Answer));
     int ret = 0;
-    uint8_t answer_buf[16*1024] = {0};
+    uint8_t buf[16 * 1024] = {0};
+    int n = 0, buf_size = sizeof(buf);
     WebrtcStreamContext *c = s->priv_data;
-    // TODO: init context func
+    URLContext *h = NULL;
+    char *username = NULL;
+    Answer *ans = NULL;
+
     c->s = s;
-    int n = 0;
-
     if (c->api == NULL) {
-        av_log(s, AV_LOG_ERROR, "Webrtc api must be specified\n");
-        return -1;
+        av_log(s, AV_LOG_ERROR, "Option api not found\n");
+        return AVERROR_OPTION_NOT_FOUND;
     }
 
-    if ((n = send_offer(s, c->api, answer_buf, sizeof(answer_buf))) != 0) {
-        return -1;
-    }
-    av_log(s, AV_LOG_INFO, "got answer %s\n", answer_buf);
+    c->answer = av_mallocz(sizeof(Answer));
+    ans = c->answer;
 
-    if (parse_answer(answer_buf, n, &answer) != 0) {
-        return -1;
-    }
-
-    create_streams_from_sdp(s, &answer.sdp);
-    c->answer_sdp = av_mallocz(sizeof(SDP));
-    memcpy(c->answer_sdp, &answer.sdp, sizeof(SDP));
-
-    char username[128] = {0};
-    memcpy(username, answer.sdp.ice_ufrag, strlen(answer.sdp.ice_ufrag));
-    username[strlen(answer.sdp.ice_ufrag)] = ':';
-    memcpy(username+strlen(answer.sdp.ice_ufrag)+1, LOCAL_ICE_UFRAG, strlen(LOCAL_ICE_UFRAG));
-    if ((ret = webrtc_connect(s, &answer.sdp.candidate, username) != 0)) {
+    if ((ret = send_offer(&h, s, c->api, OFFER_SDP)) < 0) {
+        av_log(s, AV_LOG_ERROR, "Send offer failed\n");
+        ffurl_close(h);
         return ret;
     }
+    av_log(s, AV_LOG_DEBUG, "Send offer %s to %s\n", OFFER_SDP, c->api);
+
+    while (n < buf_size) {
+        int ret = ffurl_read(h, buf + n, buf_size - n);
+        if (ret <= 0) {
+            break;
+        }
+        n += ret;
+    }
+    ffurl_close(h);
+    av_log(s, AV_LOG_DEBUG, "Got answer %s\n", buf);
+
+    if (parse_answer(ans, buf) < 0) {
+        av_log(s, AV_LOG_ERROR, "Parse answer failed\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    create_streams_from_sdp(s, &ans->sdp);
+
+    username = av_asprintf("%s:%s", ans->sdp.ice_ufrag, LOCAL_ICE_UFRAG);
+    if ((ret = webrtc_connect(s, &ans->sdp.candidate, username) != 0)) {
+        av_log(s, AV_LOG_ERROR, "Webrtc connect failed\n");
+        av_free(username);
+        return ret;
+    }
+    av_free(username);
     return ret;
 }
 
