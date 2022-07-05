@@ -106,19 +106,13 @@ const char *OFFER_SDP = "v=0\r\n"
     "a=fmtp:101 apt=100\r\n"
     "a=rtpmap:102 ulpfec/90000\r\n";
 
-static int webrtc_open(AVFormatContext *h, const char *uri)
-{
-    av_log(h, AV_LOG_INFO, "webrtc_stream_open exit\n");
-    return 0;
-}
-
 static int webrtc_stream_close(AVFormatContext *h)
 {
     av_log(h, AV_LOG_INFO, "webrtc_stream_close exit\n");
     return 0;
 }
 
-static int webrtc_stream_probe(AVProbeData *p)
+static int webrtc_stream_probe(const AVProbeData *p)
 {
     if (av_strstart(p->filename, "webrtc:", NULL))
         return AVPROBE_SCORE_MAX;
@@ -282,7 +276,7 @@ static char *read_line_arg(char *buf, int buf_size, const char *data, const char
 
 static int parse_attr(SDP *sdp, const char *data, int len)
 {
-    char *v = NULL;
+    const char *v = NULL;
     char line[1024] = {0};
     char buf[128] = {0};
 
@@ -294,7 +288,7 @@ static int parse_attr(SDP *sdp, const char *data, int len)
         // a=candidate:foundation 1 udp 100 27.159.95.33 8000 typ srflx raddr 27.159.95.33 rport 8000 generation 0
         // TODO: support multi candidate
         if (strlen(sdp->candidate.ip) == 0)
-            sscanf(v, "%*s %*d %*s %*d %s %d %*s", sdp->candidate.ip, &sdp->candidate.port);
+            sscanf(v, "%*s %*d %*s %*d %s %hd %*s", sdp->candidate.ip, &sdp->candidate.port);
     } else if (av_strstart(line, "fmtp:", &v)) {
         // a=fmtp:123 PS-enabled=0;SBR-enabled=0;config=40002420adca1fe0;cpresent=0;object=2;profile-level-id=1;stereo=1
         int l = av_stristr(v, " ") - v;
@@ -305,11 +299,11 @@ static int parse_attr(SDP *sdp, const char *data, int len)
             switch (m->type) {
             case AVMEDIA_TYPE_AUDIO: {
                 v += l + 1;
-                char *next = v;
+                const char *next = v;
                 while(next) {
                     memset(buf, 0, sizeof(buf));
                     next = read_line_arg(buf, sizeof(buf), next, ";");
-                    char *vv;
+                    const char *vv;
                     if (av_stristart(buf, "PS-enabled=", &vv)) {
                         m->ps = atoi(vv);
                     } else if (av_stristart(buf, "SBR-enabled=", &vv)) {
@@ -326,11 +320,11 @@ static int parse_attr(SDP *sdp, const char *data, int len)
             }
             case AVMEDIA_TYPE_VIDEO:{
                 v += l + 1;
-                char *next = v;
+                const char *next = v;
                 while(next) {
                     memset(buf, 0, sizeof(buf));
                     next = read_line_arg(buf, sizeof(buf), next, ";");
-                    char *vv;
+                    const char *vv;
                     if (av_stristart(buf, "bframe-enabled=", &vv)) {
                         m->bframe_enabled = atoi(vv);
                     } else if (av_stristart(buf, "level-asymmetry-allowed=", &vv)) {
@@ -376,7 +370,7 @@ static int parse_attr(SDP *sdp, const char *data, int len)
 
                 m->channel = channel;
                 m->sample_rate = sample_rate;
-                av_log(NULL, AV_LOG_DEBUG, "channel=%d sample_rate=%d\n", v, channel, sample_rate);
+                av_log(NULL, AV_LOG_DEBUG, "channel=%d sample_rate=%d\n", channel, sample_rate);
                 break;
             case AVMEDIA_TYPE_VIDEO:
                 break;
@@ -443,7 +437,7 @@ static int parse_line(SDP *sdp, const char *line, int len)
 
 static int parse_sdp(SDP *sdp, const char *data, int size)
 {
-    char *pos = data;
+    const char *pos = data;
     char *line_end = NULL;
     int len = 0;
 
@@ -495,7 +489,7 @@ static int parse_answer(Answer *answer, const char *data)
     return parse_sdp(&answer->sdp, pos, end - pos);
 }
 
-static int is_rtp(const char *data, int size)
+static int is_rtp(const uint8_t *data, int size)
 {
     if ((size > 12) && (data[0] & 0x80)) {
         if (data[1] >= 192 && data[1] <= 223) {
@@ -507,7 +501,7 @@ static int is_rtp(const char *data, int size)
     return 0;
 }
 
-static int is_rtcp(const char *data, int size)
+static int is_rtcp(const uint8_t *data, int size)
 {
     return (size > 12) && (data[0] & 0x80) && (data[1] >= 192 && data[1] <= 223);
 }
@@ -524,7 +518,7 @@ static int h264_handle_packet_fu_a(AVPacket *pkt, const uint8_t *buf, int len)
     uint8_t fu_indicator = buf[0];
     uint8_t fu_header    = buf[1];
     uint8_t start_bit    = fu_header >> 7;
-    uint8_t end_bit      = (fu_header >> 6) & 0x01;
+    // uint8_t end_bit      = (fu_header >> 6) & 0x01;
     uint8_t nal_type     = fu_header & 0x1f;
     uint8_t nal_header   = fu_indicator & 0xe0 | nal_type;
     uint8_t nal_header_len = 1;
@@ -579,15 +573,6 @@ static int is_end_frag(RTPPacket *pkt)
     uint8_t fu_header    = buf[1];
     uint8_t end_bit      = (fu_header >> 6) & 0x01;
     return end_bit;
-}
-
-static int is_key(RTPPacket *pkt)
-{
-    uint8_t *buf         = pkt->playload;
-    uint8_t fu_header    = buf[1];
-    uint8_t nal_type     = fu_header & 0x1f;
-    return nal_type == H264_NAL_IDR_SLICE ||
-           nal_type == H264_NAL_SPS || nal_type == H264_NAL_PPS;
 }
 
 static int write_rtp_packet_to_buffer(RTPMedia *m, RTPPacket *pkt)
@@ -710,7 +695,6 @@ static int read_avpackets_from_buffer(RTPMedia *m, PacketList **pkt_list)
 
 static int parse_rtp(uint8_t *buf, int size, RTPPacket *pkt)
 {
-    int pt = buf[1] & 0x7f;
     int cc = buf[0] & 0x0f;
     int ext = buf[0] & 0x10;
     pkt->seq = AV_RB16(buf+2);
@@ -817,6 +801,8 @@ static void *read_rtp_thread(void *arg)
                     pkt_list = pkt_list->next;
                 }
             }
+        } else if (is_rtcp(buf, size)) {
+            /* TODO: Handle rtcp packet */
         }
 
         int64_t cur = av_gettime();
@@ -921,14 +907,13 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
         switch (m->type) {
         case AVMEDIA_TYPE_AUDIO: {
             AVStream *st = avformat_new_stream(s, NULL);
-            WebrtcStreamContext *ctx = s->priv_data;
             st->codecpar->codec_type = m->type;
             // TODO: get audio codec from sdp
             st->codecpar->codec_id = AV_CODEC_ID_AAC;
             st->codecpar->channels = m->channel;
             st->codecpar->sample_rate = m->sample_rate;
             parse_fmtp_config(st, m->config);
-            // avpriv_set_pts_info(st, 32, 1, st->codecpar->sample_rate);
+            /* Get PTS from rtp extend header, so set 1000 as sample rate */
             avpriv_set_pts_info(st, 32, 1, 1000);
             m->stream_index = st->index;
 
@@ -939,12 +924,9 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
         }
         case AVMEDIA_TYPE_VIDEO: {
             AVStream *st = avformat_new_stream(s, NULL);
-            WebrtcStreamContext *ctx = s->priv_data;
             st->codecpar->codec_type = m->type;
             st->codecpar->codec_id = AV_CODEC_ID_H264;
             m->stream_index = st->index;
-
-            // avpriv_set_pts_info(st, 32, 1, 90000);
             avpriv_set_pts_info(st, 32, 1, 1000);
             break;
         }
@@ -1024,7 +1006,7 @@ static int webrtc_stream_read_close(AVFormatContext *s)
 #define OFFSET(x) offsetof(WebrtcStreamContext, x)
 
 static const AVOption options[] = {
-    {"api", "Pull stream API",
+    {"api", "HTTP signaling API",
         OFFSET(api), AV_OPT_TYPE_STRING,
         {.str = NULL},
         0, 0, AV_OPT_FLAG_DECODING_PARAM},
