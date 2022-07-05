@@ -125,6 +125,19 @@ static int webrtc_stream_probe(AVProbeData *p)
     return 0;
 }
 
+static RTPPacket *rtp_packet_alloc()
+{
+    return av_mallocz(sizeof(RTPPacket));
+}
+
+static void rtp_packet_free(RTPPacket *pkt)
+{
+    if (pkt) {
+        free(pkt->playload);
+        free(pkt);
+    }
+}
+
 static RTPMedia *rtp_media_create(SDP *sdp)
 {
     av_log(NULL, AV_LOG_DEBUG, "m=%p n=%d\n", sdp->medias, sdp->nb_medias + 1);
@@ -168,13 +181,13 @@ static int queue_put(AVPacketQueue *q, AVPacket *pkt)
 {
     PacketList *pkt1;
 
-    // Drop Packet if queue size is > maximum queue size
     if (queue_size(q) > (uint64_t)q->max_q_size) {
         av_packet_unref(pkt);
         av_log(q->avctx, AV_LOG_WARNING,  "Decklink input buffer overrun!\n");
         return -1;
     }
-    /* ensure the packet is reference counted */
+
+    /* Ensure the packet is reference counted */
     if (av_packet_make_refcounted(pkt) < 0) {
         av_packet_unref(pkt);
         return -1;
@@ -502,35 +515,12 @@ static int is_rtcp(const char *data, int size)
 #define NAL_MASK 0x1f
 static const uint8_t start_sequence[] = { 0, 0, 0, 1 };
 
-static int h264_handle_frag_packet(AVPacket *pkt, const uint8_t *buf, int len,
-                               int start_bit, const uint8_t *nal_header,
-                               int nal_header_len)
-{
-    int ret;
-    int tot_len = len;
-    int pos = 0;
-    if (start_bit)
-        tot_len += sizeof(start_sequence) + nal_header_len;
-    if ((ret = av_new_packet(pkt, tot_len)) < 0)
-        return ret;
-    if (start_bit) {
-        memcpy(pkt->data + pos, start_sequence, sizeof(start_sequence));
-        pos += sizeof(start_sequence);
-        memcpy(pkt->data + pos, nal_header, nal_header_len);
-        pos += nal_header_len;
-    }
-    memcpy(pkt->data + pos, buf, len);
-    return 0;
-}
-
-static int h264_handle_packet_fu_a(AVFormatContext *ctx, void *data, AVPacket *pkt,
-                                   const uint8_t *buf, int len, uint32_t dts, uint32_t cts)
+static int h264_handle_packet_fu_a(AVPacket *pkt, const uint8_t *buf, int len)
 {
     if (len < 3) {
-        av_log(ctx, AV_LOG_ERROR, "Too short data for FU-A H.264 RTP packet\n");
         return AVERROR_INVALIDDATA;
     }
-    
+
     uint8_t fu_indicator = buf[0];
     uint8_t fu_header    = buf[1];
     uint8_t start_bit    = fu_header >> 7;
@@ -539,7 +529,7 @@ static int h264_handle_packet_fu_a(AVFormatContext *ctx, void *data, AVPacket *p
     uint8_t nal_header   = fu_indicator & 0xe0 | nal_type;
     uint8_t nal_header_len = 1;
 
-    // skip the fu_indicator and fu_header
+    /* Skip the fu_indicator and fu_header */
     buf += 2;
     len -= 2;
 
@@ -555,9 +545,7 @@ static int h264_handle_packet_fu_a(AVFormatContext *ctx, void *data, AVPacket *p
         memcpy(pkt->data + pos, &nal_header, nal_header_len);
         pos += nal_header_len;
         memcpy(pkt->data + pos, buf, len);
-        pkt->dts = dts;
-        pkt->pts = dts + cts;
-        if (nal_type == H264_NAL_IDR_SLICE)
+        if (nal_type == H264_NAL_IDR_SLICE || nal_type == H264_NAL_SPS || nal_type == H264_NAL_PPS)
             pkt->flags |= AV_PKT_FLAG_KEY;
     } else {
         pos = pkt->size;
@@ -566,147 +554,230 @@ static int h264_handle_packet_fu_a(AVFormatContext *ctx, void *data, AVPacket *p
         memcpy(pkt->data + pos, buf, len);
     }
 
-    if (end_bit) {
-        return 0;
-    }
-    return pkt->size;
+    return 0;
 }
 
-static int h264_handle_aggregated_packet(AVFormatContext *ctx, void *data, AVPacket *pkt,
-                                     const uint8_t *buf, int len,
-                                     int skip_between, int *nal_counters,
-                                     int nal_mask, uint32_t dts, uint32_t cts)
+static int is_fragment(RTPPacket *pkt)
 {
-    int pass         = 0;
-    int total_length = 0;
-    uint8_t *dst     = NULL;
-    int ret;
+    uint8_t *buf = pkt->playload;
+    uint8_t nal  = buf[0];
+    uint8_t type = nal & 0x1f;
+    return type == 28;
+}
 
-    // first we are going to figure out the total size
-    for (pass = 0; pass < 2; pass++) {
-        const uint8_t *src = buf;
-        int src_len        = len;
+static int is_start_frag(RTPPacket *pkt)
+{
+    uint8_t *buf         = pkt->playload;
+    uint8_t fu_header    = buf[1];
+    uint8_t start_bit    = fu_header >> 7;
+    return start_bit;
+}
 
-        while (src_len > 2) {
-            uint16_t nal_size = AV_RB16(src);
+static int is_end_frag(RTPPacket *pkt)
+{
+    uint8_t *buf         = pkt->playload;
+    uint8_t fu_header    = buf[1];
+    uint8_t end_bit      = (fu_header >> 6) & 0x01;
+    return end_bit;
+}
 
-            // consume the length of the aggregate
-            src     += 2;
-            src_len -= 2;
+static int is_key(RTPPacket *pkt)
+{
+    uint8_t *buf         = pkt->playload;
+    uint8_t fu_header    = buf[1];
+    uint8_t nal_type     = fu_header & 0x1f;
+    return nal_type == H264_NAL_IDR_SLICE ||
+           nal_type == H264_NAL_SPS || nal_type == H264_NAL_PPS;
+}
 
-            if (nal_size <= src_len) {
-                if (pass == 0) {
-                    // counting
-                    total_length += sizeof(start_sequence) + nal_size;
+static int write_rtp_packet_to_buffer(RTPMedia *m, RTPPacket *pkt)
+{
+    if (!m->buf) {
+        m->buf_len = 4096;
+        m->buf = av_mallocz(m->buf_len * sizeof(RTPPacket *));
+    }
+
+    int index = pkt->seq % m->buf_len;
+    if (m->buf[index]) {
+        if (m->buf[index]->seq == pkt->seq) {
+            /* Duplicated */
+            rtp_packet_free(pkt);
+            return 0;
+        }
+        rtp_packet_free(m->buf[index]);
+    }
+
+    m->buf[index] = pkt;
+
+    if (!m->first) {
+        m->seq = pkt->seq;
+        m->first = 1;
+    }
+
+    m->packet_num++;
+    if (m->packet_num > m->buf_len) {
+        /* Buffer over flow, move seq to new frame */
+        int i = m->seq; 
+        while (i - m->seq < m->buf_len) {
+            RTPPacket *cur = m->buf[i % m->buf_len];
+            if (cur) {
+                if (is_fragment(cur)) {
+                    if (is_start_frag(cur)) {
+                        m->seq = cur->seq;
+                        break;
+                    }
                 } else {
-                    // copying
-                    memcpy(dst, start_sequence, sizeof(start_sequence));
-                    dst += sizeof(start_sequence);
-                    memcpy(dst, src, nal_size);
-                    if (nal_counters)
-                        nal_counters[(*src) & nal_mask]++;
-                    dst += nal_size;
+                    m->seq = cur->seq;
+                    break;
                 }
-            } else {
-                av_log(ctx, AV_LOG_ERROR,
-                       "nal size exceeds length: %d %d\n", nal_size, src_len);
-                return AVERROR_INVALIDDATA;
+            }
+            i++;
+        }
+    }
+
+    return 0;
+}
+
+static int read_avpackets_from_buffer(RTPMedia *m, PacketList **pkt_list)
+{
+    int index = m->seq % m->buf_len;
+    RTPPacket *cur = m->buf[index], *start = NULL;
+
+    while (cur) {
+        if (is_fragment(cur)) {
+            if (is_start_frag(cur)) {
+                start = cur;
+            } else if (is_end_frag(cur)) {
+                if (start) {
+                    uint16_t i = start->seq;
+                    uint16_t start_seq = start->seq;
+                    uint16_t end_seq = cur->seq;
+                    for (; i <= end_seq; i++) {
+                        RTPPacket *rtp = m->buf[i % m->buf_len];
+                        if (i == start_seq) {
+                            if (*pkt_list == NULL) {
+                                *pkt_list = av_mallocz(sizeof(PacketList));
+                            } else {
+                                (*pkt_list)->next = av_mallocz(sizeof(PacketList));
+                                *pkt_list = (*pkt_list)->next;
+                            }
+                            h264_handle_packet_fu_a(&(*pkt_list)->pkt, rtp->playload, rtp->playload_size);
+                            (*pkt_list)->pkt.dts = start->ext_dts;
+                            (*pkt_list)->pkt.pts = start->ext_dts + start->ext_cts;
+                            (*pkt_list)->pkt.stream_index = m->stream_index;
+                        } else {
+                            h264_handle_packet_fu_a(&(*pkt_list)->pkt, rtp->playload, rtp->playload_size);
+                        }
+                        rtp_packet_free(rtp);
+                        m->buf[i % m->buf_len] = NULL;
+                        m->packet_num--;
+                    }
+                    m->seq = i;
+                    start = NULL;
+                }
+            }
+        } else {
+            if (start) {
+                /* Break fragment */
+                break;
             }
 
-            // eat what we handled
-            src     += nal_size + skip_between;
-            src_len -= nal_size + skip_between;
+            if (*pkt_list == NULL) {
+                *pkt_list = av_mallocz(sizeof(PacketList));
+            } else {
+                (*pkt_list)->next = av_mallocz(sizeof(PacketList));
+                *pkt_list = (*pkt_list)->next;
+            }
+
+            av_new_packet(&(*pkt_list)->pkt, cur->playload_size + sizeof(start_sequence));
+            memcpy((*pkt_list)->pkt.data, start_sequence, sizeof(start_sequence));
+            memcpy((*pkt_list)->pkt.data + sizeof(start_sequence), cur->playload, cur->playload_size);
+            (*pkt_list)->pkt.dts = cur->ext_dts;
+            (*pkt_list)->pkt.pts = cur->ext_dts + cur->ext_cts;
+            (*pkt_list)->pkt.flags |= AV_PKT_FLAG_KEY;
+            (*pkt_list)->pkt.stream_index = m->stream_index;
+            m->seq = cur->seq + 1;
+            m->buf[cur->seq % m->buf_len] = NULL;
+            rtp_packet_free(cur);
+            m->packet_num--;
         }
 
-        if (pass == 0) {
-            /* now we know the total size of the packet (with the
-             * start sequences added) */
-            if ((ret = av_new_packet(pkt, total_length)) < 0)
-                return ret;
-            dst = pkt->data;
-            pkt->dts = dts;
-            pkt->pts = dts + cts;
-        }
+        index++;
+        cur = m->buf[index % m->buf_len];
     }
-
     return 0;
 }
 
-static int handle_audio_payload(AVFormatContext *s, AVPacket **pkt, const uint8_t *buf, int size)
+static int parse_rtp(uint8_t *buf, int size, RTPPacket *pkt)
 {
-    *pkt = av_packet_alloc();
-    av_new_packet(*pkt, size);
-    memcpy((*pkt)->data, buf, size);
+    int pt = buf[1] & 0x7f;
+    int cc = buf[0] & 0x0f;
+    int ext = buf[0] & 0x10;
+    pkt->seq = AV_RB16(buf+2);
+    pkt->ts = AV_RB32(buf+4);
+    int pos = 12 + cc * 4;
+    if (ext) {
+        if ((buf[pos] == 0xbe) && (buf[pos+1] == 0xde)) {
+            /* One-byte extension */
+            pos += 2;
+            int len = (buf[pos] << 8) | buf[pos+1];
+            pos += 2;
+            for (int i = 0; i < len * 4;) {
+                if (buf[pos+i] == 0) {
+                    i++;
+                    continue;
+                }
+                int id = (buf[pos+i] >> 4) & 0x0f;
+                int l = buf[pos+i] & 0x0f;
+                switch (id) {
+                case DTS_EXTMAP:
+                    for (int j = 0; j < l+1; j++) {
+                        pkt->ext_dts = (buf[pos+i+1+j] << (8 * (l-j))) | pkt->ext_dts;
+                    }
+                    break;
+                case CTS_EXTMAP:
+                    for (int j = 0; j < l+1; j++) {
+                        pkt->ext_cts = (buf[pos+i+1+j] << (8 * (l-j))) | pkt->ext_cts;
+                    }
+                    break;
+                default:
+                    break;
+                }
+                i += 1 + l + 1;
+            }
+            pos += len * 4;
+        } else if ((buf[pos] == 0x10) && (((buf[pos+1] >> 4) & 0x0f) == 0)) {
+            /* Two-byte extension */
+            pos += 2;
+            int len = buf[pos] << 8 | buf[pos+1];
+            pos += 2;
+            for (int i = 0; i < len*4;) {
+                int id = buf[pos+i];
+                int l = buf[pos+i+1];
+                switch (id) {
+                case DTS_EXTMAP:
+                    for (int j = 0; j < l; j++) {
+                        pkt->ext_dts = (buf[pos+i+2+j] << (8 * (l-j-1))) | pkt->ext_dts;
+                    }
+                    break;
+                case CTS_EXTMAP:
+                    for (int j = 0; j < l; j++) {
+                        pkt->ext_cts = (buf[pos+i+2+j] << (8 * (l-j-1))) | pkt->ext_cts;
+                    }
+                    break;
+                default:
+                    break;
+                }
+                i += 2 + l;
+            }
+            pos += len * 4;
+        }
+    }
+
+    pkt->playload_size = size - pos;
+    pkt->playload = av_mallocz(pkt->playload_size);
+    memcpy(pkt->playload, buf + pos, pkt->playload_size);
     return 0;
-}
-
-static int handle_video_payload(AVFormatContext *ctx, AVPacket **unfinished_pkt,
-                                const uint8_t *buf, int len, uint32_t dts, uint32_t cts)
-{
-    uint8_t nal;
-    uint8_t type;
-    int result = 0;
-
-    if (!len) {
-        av_log(ctx, AV_LOG_ERROR, "Empty H.264 RTP packet\n");
-        return AVERROR_INVALIDDATA;
-    }
-    nal  = buf[0];
-    type = nal & 0x1f;
-
-    /* Simplify the case (these are all the NAL types used internally by
-     * the H.264 codec). */
-    if (type >= 1 && type <= 23)
-        type = 1;
-
-    if (*unfinished_pkt == NULL) {
-        *unfinished_pkt = av_packet_alloc();
-    }
-    AVPacket *pkt = *unfinished_pkt;
-
-    switch (type) {
-    case 0:             // undefined, but pass them through
-    case 1:
-    case 7:             // SPS
-    case 8:             // PPS
-    case 31:            // private type
-        if ((result = av_new_packet(pkt, len + sizeof(start_sequence))) < 0)
-            return result;
-        pkt->dts = dts;
-        pkt->pts = dts + cts;
-        pkt->flags |= AV_PKT_FLAG_KEY;
-        memcpy(pkt->data, start_sequence, sizeof(start_sequence));
-        memcpy(pkt->data + sizeof(start_sequence), buf, len);
-        break;
-
-    case 24:                   // STAP-A (one packet, multiple nals)
-        // consume the STAP-A NAL
-        buf++;
-        len--;
-        result = h264_handle_aggregated_packet(ctx, NULL, pkt, buf, len, 0,
-                                                  NULL, NAL_MASK, dts, cts);
-        break;
-
-    case 25:                   // STAP-B
-    case 26:                   // MTAP-16
-    case 27:                   // MTAP-24
-    case 29:                   // FU-B
-        avpriv_report_missing_feature(ctx, "RTP H.264 NAL unit type %d", type);
-        result = AVERROR_PATCHWELCOME;
-        break;
-
-    case 28:                   // FU-A (fragmented nal)
-        result = h264_handle_packet_fu_a(ctx, NULL, pkt, buf, len, dts, cts);
-        break;
-
-    case 30:                   // undefined
-    default:
-        av_log(ctx, AV_LOG_ERROR, "Undefined type (%d)\n", type);
-        result = AVERROR_INVALIDDATA;
-        break;
-    }
-
-    return result;
 }
 
 static void *read_rtp_thread(void *arg)
@@ -714,95 +785,36 @@ static void *read_rtp_thread(void *arg)
     WebrtcStreamContext *ctx = arg;
     int ret = 0;
     uint8_t buf[2048];
+
     for(;;) {
         ret = ffurl_read(ctx->rtp_hd, buf, sizeof(buf));
         int size = ret;
         if (is_rtp(buf, size)) {
             int pt = buf[1] & 0x7f;
-            int cc = buf[0] & 0x0f;
-            int ext = buf[0] & 0x10;
-            uint16_t seq = AV_RB16(buf+2);
-            uint32_t ts = AV_RB32(buf+4);
-            int pos = 12 + cc * 4;
-            uint32_t dts = 0;
-            uint32_t cts = 0;
-            if (ext) {
-                if ((buf[pos] == 0xbe) && (buf[pos+1] == 0xde)) {
-                    // ony-byte extension
-                    pos += 2;
-                    int len = (buf[pos] << 8) | buf[pos+1];
-                    pos += 2;
-                    for (int i = 0; i < len * 4;) {
-                        if (buf[pos+i] == 0) {
-                            i++;
-                            continue;
-                        }
-                        int id = (buf[pos+i] >> 4) & 0x0f;
-                        int l = buf[pos+i] & 0x0f;
-                        switch (id) {
-                        case DTS_EXTMAP:
-                            for (int j = 0; j < l+1; j++) {
-                                dts = (buf[pos+i+1+j] << (8 * (l-j))) | dts;
-                            }
-                            break;
-                        case CTS_EXTMAP:
-                            for (int j = 0; j < l+1; j++) {
-                                cts = (buf[pos+i+1+j] << (8 * (l-j))) | cts;
-                            }
-                            break;
-                        default:
-                            break;
-                        }
-                        i += 1 + l + 1;
-                    }
-                    pos += len * 4;
-                } else if ((buf[pos] == 0x10) && (((buf[pos+1] >> 4) & 0x0f) == 0)) {
-                    // two-byte extension
-                    pos += 2;
-                    int len = buf[pos] << 8 | buf[pos+1];
-                    pos += 2;
-                    for (int i = 0; i < len*4;) {
-                        int id = buf[pos+i];
-                        int l = buf[pos+i+1];
-                        switch (id) {
-                        case DTS_EXTMAP:
-                            for (int j = 0; j < l; j++) {
-                                dts = (buf[pos+i+2+j] << (8 * (l-j-1))) | dts;
-                            }
-                            break;
-                        case CTS_EXTMAP:
-                            for (int j = 0; j < l; j++) {
-                                cts = (buf[pos+i+2+j] << (8 * (l-j-1))) | cts;
-                            }
-                            break;
-                        default:
-                            break;
-                        }
-                        i += 2 + l;
-                    }
-                    pos += len * 4;
-                }
+            RTPMedia *m = get_media(&ctx->answer->sdp, pt);
+            if (!m) {
+                continue;
             }
 
-            RTPMedia *m = get_media(&ctx->answer->sdp, pt);
-            if (m) {
-                int payload_size = size - pos;
-                AVPacket *pkt = NULL;
-                uint8_t *payload = buf + pos;
-                if (m->type == AVMEDIA_TYPE_AUDIO) {
-                    handle_audio_payload(ctx->s, &pkt, payload, payload_size);
-                    pkt->dts = dts;
-                    pkt->pts = dts+cts;
-                    pkt->flags |= AV_PKT_FLAG_KEY;
-                } else if (m->type == AVMEDIA_TYPE_VIDEO) {
-                    if (handle_video_payload(ctx->s, &ctx->unfinished_pkt, payload, payload_size, dts, cts) == 0) {
-                        pkt = ctx->unfinished_pkt;
-                        ctx->unfinished_pkt = NULL;
-                    }
-                }
-                if (pkt) {
-                    pkt->stream_index = ctx->stream_index[pt] ? ctx->stream_index[pt]->index : 0;
+            RTPPacket *rtp_pkt = rtp_packet_alloc();
+            parse_rtp(buf, size, rtp_pkt);
+            if (m->type == AVMEDIA_TYPE_AUDIO) {
+                AVPacket *pkt = av_packet_alloc();
+                av_new_packet(pkt, rtp_pkt->playload_size);
+                memcpy(pkt->data, rtp_pkt->playload, rtp_pkt->playload_size);
+                pkt->dts = rtp_pkt->ext_dts;
+                pkt->pts = rtp_pkt->ext_dts + rtp_pkt->ext_cts;
+                pkt->flags |= AV_PKT_FLAG_KEY;
+                pkt->stream_index = m->stream_index;
+                queue_put(&ctx->queue, pkt);
+            } else if (m->type == AVMEDIA_TYPE_VIDEO) {
+                write_rtp_packet_to_buffer(m, rtp_pkt);
+                PacketList *pkt_list = NULL;
+                read_avpackets_from_buffer(m, &pkt_list);
+                while (pkt_list) {
+                    AVPacket *pkt = &pkt_list->pkt;
                     queue_put(&ctx->queue, pkt);
+                    pkt_list = pkt_list->next;
                 }
             }
         }
@@ -918,8 +930,8 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             parse_fmtp_config(st, m->config);
             // avpriv_set_pts_info(st, 32, 1, st->codecpar->sample_rate);
             avpriv_set_pts_info(st, 32, 1, 1000);
+            m->stream_index = st->index;
 
-            ctx->stream_index[m->id] = st;
             av_log(s, AV_LOG_DEBUG, "Media channels=%d sample_rate=%d extradata=%s extradata_size=%d\n",
                 st->codecpar->channels, st->codecpar->sample_rate,
                 st->codecpar->extradata, st->codecpar->extradata_size);
@@ -930,7 +942,8 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             WebrtcStreamContext *ctx = s->priv_data;
             st->codecpar->codec_type = m->type;
             st->codecpar->codec_id = AV_CODEC_ID_H264;
-            ctx->stream_index[m->id] = st;
+            m->stream_index = st->index;
+
             // avpriv_set_pts_info(st, 32, 1, 90000);
             avpriv_set_pts_info(st, 32, 1, 1000);
             break;

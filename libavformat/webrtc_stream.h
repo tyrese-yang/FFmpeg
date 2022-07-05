@@ -5,6 +5,17 @@
 
 #include "stun.h"
 
+typedef struct RTPPacket {
+    uint16_t seq;
+    uint32_t ts;
+    uint8_t *playload;
+    int playload_size;
+
+    /* Extend data */
+    uint32_t ext_dts;
+    uint32_t ext_cts;
+} RTPPacket;
+
 typedef struct PacketList {
     struct PacketList *next;
     AVPacket pkt;
@@ -28,6 +39,7 @@ typedef struct Candidate {
 
 typedef struct RTPMedia {
     int id;
+    int stream_index;
     enum AVMediaType type;
 
     // Audio info
@@ -44,6 +56,14 @@ typedef struct RTPMedia {
     int level_asymmetry_allowed;
     int packetization_mode;
     char video_pl_id[128]; // video profile level id
+
+    RTPPacket **buf;
+    int buf_len;
+    int packet_num;
+    uint16_t seq;
+    int first;
+
+    AVPacket *pend;
 } RTPMedia;
 
 // TODO: free
@@ -76,7 +96,6 @@ typedef struct WebrtcStreamContext {
     URLContext *rtp_hd;
     pthread_t thread;
     AVPacketQueue queue;
-    AVStream *stream_index[256];
     AVPacket *unfinished_pkt;
 
     stun_message_t *stun_bind_req;
