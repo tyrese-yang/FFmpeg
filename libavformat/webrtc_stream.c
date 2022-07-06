@@ -142,11 +142,30 @@ static RTPMedia *rtp_media_create(SDP *sdp)
     return m;
 }
 
-static RTPMedia *get_media(const SDP *sdp, uint32_t id)
+static RTPMedia *rtp_media_get(const SDP *sdp, uint16_t pt)
 {
     for (int i = 0; i < sdp->nb_medias; i++) {
-        if (sdp->medias[i]->id == id) {
+        if (sdp->medias[i]->pt == pt) {
             return sdp->medias[i];
+        }
+    }
+    return NULL;
+}
+
+static RTPStream *rtp_stream_create(WebrtcStreamContext *ctx)
+{
+    RTPStream **streams = av_realloc_array(ctx->rtp_streams, ctx->nb_rtp_streams + 1, sizeof(*streams));
+    ctx->rtp_streams = streams;
+    RTPStream *rs = av_mallocz(sizeof(RTPStream));
+    ctx->rtp_streams[ctx->nb_rtp_streams++] = rs;
+    return rs;
+}
+
+static RTPStream *rtp_stream_get(WebrtcStreamContext *ctx, uint8_t pt)
+{
+    for (int i = 0; i < ctx->nb_rtp_streams; i++) {
+        if (ctx->rtp_streams[i]->pt == pt) {
+            return ctx->rtp_streams[i];
         }
     }
     return NULL;
@@ -293,8 +312,8 @@ static int parse_attr(SDP *sdp, const char *data, int len)
         // a=fmtp:123 PS-enabled=0;SBR-enabled=0;config=40002420adca1fe0;cpresent=0;object=2;profile-level-id=1;stereo=1
         int l = av_stristr(v, " ") - v;
         memcpy(buf, v, l);
-        int id = atoi(buf);
-        RTPMedia *m = get_media(sdp, id);
+        int pt = atoi(buf);
+        RTPMedia *m = rtp_media_get(sdp, pt);
         if (m) {
             switch (m->type) {
             case AVMEDIA_TYPE_AUDIO: {
@@ -347,8 +366,8 @@ static int parse_attr(SDP *sdp, const char *data, int len)
         int l = 0;
         l = av_stristr(v, " ") - v;
         memcpy(buf, v, l);
-        int id = atoi(buf);
-        RTPMedia *m = get_media(sdp, id);
+        int pt = atoi(buf);
+        RTPMedia *m = rtp_media_get(sdp, pt);
         if (m) {
             switch (m->type) {
             case AVMEDIA_TYPE_AUDIO:
@@ -399,7 +418,7 @@ static int parse_mline(SDP *sdp, const char *data, int len)
             char buf[8] = {0};
             next = read_line_arg(buf, sizeof(buf), next, " ");
             RTPMedia *m = rtp_media_create(sdp);
-            m->id = atoi(buf);
+            m->pt = atoi(buf);
             m->type = AVMEDIA_TYPE_AUDIO;
         }
     } else if (av_strstart(line, "video", NULL)) {
@@ -412,7 +431,7 @@ static int parse_mline(SDP *sdp, const char *data, int len)
             char buf[8] = {0};
             next = read_line_arg(buf, sizeof(buf), next, " ");
             RTPMedia *m = rtp_media_create(sdp);
-            m->id = atoi(buf);
+            m->pt = atoi(buf);
             m->type = AVMEDIA_TYPE_VIDEO;
         }
     }
@@ -575,44 +594,44 @@ static int is_end_frag(RTPPacket *pkt)
     return end_bit;
 }
 
-static int write_rtp_packet_to_buffer(RTPMedia *m, RTPPacket *pkt)
+static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
 {
-    if (!m->buf) {
-        m->buf_len = 4096;
-        m->buf = av_mallocz(m->buf_len * sizeof(RTPPacket *));
+    if (!rs->buf) {
+        rs->buf_len = 4096;
+        rs->buf = av_mallocz(rs->buf_len * sizeof(RTPPacket *));
     }
 
-    int index = pkt->seq % m->buf_len;
-    if (m->buf[index]) {
-        if (m->buf[index]->seq == pkt->seq) {
+    int index = pkt->seq % rs->buf_len;
+    if (rs->buf[index]) {
+        if (rs->buf[index]->seq == pkt->seq) {
             /* Duplicated */
             rtp_packet_free(pkt);
             return 0;
         }
-        rtp_packet_free(m->buf[index]);
+        rtp_packet_free(rs->buf[index]);
     }
 
-    m->buf[index] = pkt;
+    rs->buf[index] = pkt;
 
-    if (!m->first) {
-        m->seq = pkt->seq;
-        m->first = 1;
+    if (!rs->first) {
+        rs->seq = pkt->seq;
+        rs->first = 1;
     }
 
-    m->packet_num++;
-    if (m->packet_num > m->buf_len) {
+    rs->packet_num++;
+    if (rs->packet_num > rs->buf_len) {
         /* Buffer over flow, move seq to new frame */
-        int i = m->seq; 
-        while (i - m->seq < m->buf_len) {
-            RTPPacket *cur = m->buf[i % m->buf_len];
+        int i = rs->seq; 
+        while (i - rs->seq < rs->buf_len) {
+            RTPPacket *cur = rs->buf[i % rs->buf_len];
             if (cur) {
                 if (is_fragment(cur)) {
                     if (is_start_frag(cur)) {
-                        m->seq = cur->seq;
+                        rs->seq = cur->seq;
                         break;
                     }
                 } else {
-                    m->seq = cur->seq;
+                    rs->seq = cur->seq;
                     break;
                 }
             }
@@ -623,10 +642,10 @@ static int write_rtp_packet_to_buffer(RTPMedia *m, RTPPacket *pkt)
     return 0;
 }
 
-static int read_avpackets_from_buffer(RTPMedia *m, PacketList **pkt_list)
+static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
 {
-    int index = m->seq % m->buf_len;
-    RTPPacket *cur = m->buf[index], *start = NULL;
+    int index = rs->seq % rs->buf_len;
+    RTPPacket *cur = rs->buf[index], *start = NULL;
 
     while (cur) {
         if (is_fragment(cur)) {
@@ -638,7 +657,7 @@ static int read_avpackets_from_buffer(RTPMedia *m, PacketList **pkt_list)
                     uint16_t start_seq = start->seq;
                     uint16_t end_seq = cur->seq;
                     for (; i <= end_seq; i++) {
-                        RTPPacket *rtp = m->buf[i % m->buf_len];
+                        RTPPacket *rtp = rs->buf[i % rs->buf_len];
                         if (i == start_seq) {
                             if (*pkt_list == NULL) {
                                 *pkt_list = av_mallocz(sizeof(PacketList));
@@ -649,15 +668,15 @@ static int read_avpackets_from_buffer(RTPMedia *m, PacketList **pkt_list)
                             h264_handle_packet_fu_a(&(*pkt_list)->pkt, rtp->playload, rtp->playload_size);
                             (*pkt_list)->pkt.dts = start->ext_dts;
                             (*pkt_list)->pkt.pts = start->ext_dts + start->ext_cts;
-                            (*pkt_list)->pkt.stream_index = m->stream_index;
+                            (*pkt_list)->pkt.stream_index = rs->stream_index;
                         } else {
                             h264_handle_packet_fu_a(&(*pkt_list)->pkt, rtp->playload, rtp->playload_size);
                         }
                         rtp_packet_free(rtp);
-                        m->buf[i % m->buf_len] = NULL;
-                        m->packet_num--;
+                        rs->buf[i % rs->buf_len] = NULL;
+                        rs->packet_num--;
                     }
-                    m->seq = i;
+                    rs->seq = i;
                     start = NULL;
                 }
             }
@@ -680,15 +699,15 @@ static int read_avpackets_from_buffer(RTPMedia *m, PacketList **pkt_list)
             (*pkt_list)->pkt.dts = cur->ext_dts;
             (*pkt_list)->pkt.pts = cur->ext_dts + cur->ext_cts;
             (*pkt_list)->pkt.flags |= AV_PKT_FLAG_KEY;
-            (*pkt_list)->pkt.stream_index = m->stream_index;
-            m->seq = cur->seq + 1;
-            m->buf[cur->seq % m->buf_len] = NULL;
+            (*pkt_list)->pkt.stream_index = rs->stream_index;
+            rs->seq = cur->seq + 1;
+            rs->buf[cur->seq % rs->buf_len] = NULL;
             rtp_packet_free(cur);
-            m->packet_num--;
+            rs->packet_num--;
         }
 
         index++;
-        cur = m->buf[index % m->buf_len];
+        cur = rs->buf[index % rs->buf_len];
     }
     return 0;
 }
@@ -774,27 +793,27 @@ static void *read_rtp_thread(void *arg)
         ret = ffurl_read(ctx->rtp_hd, buf, sizeof(buf));
         int size = ret;
         if (is_rtp(buf, size)) {
-            int pt = buf[1] & 0x7f;
-            RTPMedia *m = get_media(&ctx->answer->sdp, pt);
-            if (!m) {
+            uint8_t pt = buf[1] & 0x7f;
+            RTPStream *rs = rtp_stream_get(ctx, pt);
+            if (!rs) {
                 continue;
             }
 
             RTPPacket *rtp_pkt = rtp_packet_alloc();
             parse_rtp(buf, size, rtp_pkt);
-            if (m->type == AVMEDIA_TYPE_AUDIO) {
+            if (rs->type == AVMEDIA_TYPE_AUDIO) {
                 AVPacket *pkt = av_packet_alloc();
                 av_new_packet(pkt, rtp_pkt->playload_size);
                 memcpy(pkt->data, rtp_pkt->playload, rtp_pkt->playload_size);
                 pkt->dts = rtp_pkt->ext_dts;
                 pkt->pts = rtp_pkt->ext_dts + rtp_pkt->ext_cts;
                 pkt->flags |= AV_PKT_FLAG_KEY;
-                pkt->stream_index = m->stream_index;
+                pkt->stream_index = rs->stream_index;
                 queue_put(&ctx->queue, pkt);
-            } else if (m->type == AVMEDIA_TYPE_VIDEO) {
-                write_rtp_packet_to_buffer(m, rtp_pkt);
+            } else if (rs->type == AVMEDIA_TYPE_VIDEO) {
+                write_rtp_packet_to_buffer(rs, rtp_pkt);
                 PacketList *pkt_list = NULL;
-                read_avpackets_from_buffer(m, &pkt_list);
+                read_avpackets_from_buffer(rs, &pkt_list);
                 while (pkt_list) {
                     AVPacket *pkt = &pkt_list->pkt;
                     queue_put(&ctx->queue, pkt);
@@ -902,6 +921,7 @@ end:
 
 static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
 {
+    WebrtcStreamContext *ctx = s->priv_data;
     for (int i = 0; i < sdp->nb_medias; i++) {
         RTPMedia *m = sdp->medias[i];
         switch (m->type) {
@@ -915,7 +935,11 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             parse_fmtp_config(st, m->config);
             /* Get PTS from rtp extend header, so set 1000 as sample rate */
             avpriv_set_pts_info(st, 32, 1, 1000);
-            m->stream_index = st->index;
+
+            RTPStream *rs = rtp_stream_create(ctx);
+            rs->stream_index = st->index;
+            rs->pt = m->pt;
+            rs->type = m->type;
 
             av_log(s, AV_LOG_DEBUG, "Media channels=%d sample_rate=%d extradata=%s extradata_size=%d\n",
                 st->codecpar->channels, st->codecpar->sample_rate,
@@ -926,8 +950,12 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             AVStream *st = avformat_new_stream(s, NULL);
             st->codecpar->codec_type = m->type;
             st->codecpar->codec_id = AV_CODEC_ID_H264;
-            m->stream_index = st->index;
             avpriv_set_pts_info(st, 32, 1, 1000);
+
+            RTPStream *rs = rtp_stream_create(ctx);
+            rs->stream_index = st->index;
+            rs->pt = m->pt;
+            rs->type = m->type;
             break;
         }
         default:

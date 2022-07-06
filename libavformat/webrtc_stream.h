@@ -38,8 +38,7 @@ typedef struct Candidate {
 } Candidate;
 
 typedef struct RTPMedia {
-    int id;
-    int stream_index;
+    int pt;
     enum AVMediaType type;
 
     // Audio info
@@ -56,14 +55,6 @@ typedef struct RTPMedia {
     int level_asymmetry_allowed;
     int packetization_mode;
     char video_pl_id[128]; // video profile level id
-
-    RTPPacket **buf;
-    int buf_len;
-    int packet_num;
-    uint16_t seq;
-    int first;
-
-    AVPacket *pend;
 } RTPMedia;
 
 // TODO: free
@@ -86,6 +77,20 @@ typedef struct Answer {
     SDP sdp;
 } Answer;
 
+typedef struct RTPStream {
+    uint8_t pt;
+    enum AVMediaType type;
+    int stream_index;
+
+    RTPPacket **buf;
+    int buf_len;
+    int packet_num;
+    uint16_t seq;
+    int first;
+
+    AVPacket *pend;
+} RTPStream;
+
 typedef struct WebrtcStreamContext {
     const AVClass *class;
     AVFormatContext *s;
@@ -100,5 +105,8 @@ typedef struct WebrtcStreamContext {
 
     stun_message_t *stun_bind_req;
     int64_t last_bind_req_time;
+
+    RTPStream **rtp_streams;
+    int nb_rtp_streams;
 } WebrtcStreamContext;
 #endif // WEBRTC_STREAM_H
