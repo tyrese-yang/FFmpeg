@@ -15,6 +15,11 @@
 
 #include "webrtc_stream.h"
 
+/*
+ * Signal spec:
+ *      https://github.com/tencentyun/leb-android-sdk/blob/master/docs/leb_signal_spec.pdf
+ */
+
 #define STUN_BINDING_INTERVAL 2000 // ms
 #define STUN_BINDING_PASSWORD "ffmpeg"
 #define LOCAL_ICE_UFRAG "ffmpeg"
@@ -37,12 +42,6 @@ const char *OFFER_SDP = "v=0\r\n"
     "a=ice-pwd:y3yqjhruMPu9GFrOGF/WBN3q\r\n"
     "a=ice-options:trickle\r\n"
     "a=mid:0\r\n"
-    "a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n"
-    "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n"
-    "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n"
-    "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\r\n"
-    "a=extmap:5 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n"
-    "a=extmap:6 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id\r\n"
     "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
     "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
     "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
@@ -53,58 +52,27 @@ const char *OFFER_SDP = "v=0\r\n"
     "a=rtcp-fb:122 transport-cc\r\n"
     "a=rtpmap:123 MP4A-ADTS/44100/2\r\n"
     "a=rtcp-fb:123 transport-cc\r\n"
-    "m=video 9 RTP/AVPF 96 97 98 99 100 101 102\r\n"
+    "m=video 9 RTP/AVPF 96 98\r\n"
     "c=IN IP4 0.0.0.0\r\n"
     "a=rtcp:9 IN IP4 0.0.0.0\r\n"
     "a=ice-ufrag:"LOCAL_ICE_UFRAG"\r\n"
     "a=ice-pwd:y3yqjhruMPu9GFrOGF/WBN3q\r\n"
     "a=ice-options:trickle\r\n"
     "a=mid:1\r\n"
-    "a=extmap:14 urn:ietf:params:rtp-hdrext:toffset\r\n"
-    "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n"
-    "a=extmap:13 urn:3gpp:video-orientation\r\n"
-    "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n"
-    "a=extmap:12 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\r\n"
-    "a=extmap:11 http://www.webrtc.org/experiments/rtp-hdrext/video-content-type\r\n"
-    "a=extmap:15 http://www.webrtc.org/experiments/rtp-hdrext/video-timing\r\n"
-    "a=extmap:16 http://tools.ietf.org/html/draft-ietf-avtext-framemarking-07\r\n"
-    "a=extmap:17 http://www.webrtc.org/experiments/rtp-hdrext/color-space\r\n"
-    "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\r\n"
-    "a=extmap:5 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n"
-    "a=extmap:6 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id\r\n"
     "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
     "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
     "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
     "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
     "a=extmap:18 http://www.webrtc.org/experiments/rtp-hdrext/video-composition-time\r\n"
-    "a=extmap:19 http://www.webrtc.org/experiments/rtp-hdrext/video-frame-type\r\n"
     "a=recvonly\r\n"
     "a=rtcp-mux\r\n"
     "a=rtcp-rsize\r\n"
     "a=rtpmap:96 H264/90000\r\n"
-    // "a=rtcp-fb:96 goog-remb\r\n"
-    // "a=rtcp-fb:96 transport-cc\r\n"
-    // "a=rtcp-fb:96 ccm fir\r\n"
     // "a=rtcp-fb:96 nack\r\n"
-    // "a=rtcp-fb:96 nack pli\r\n"
-    // "a=rtcp-fb:96 rrtr\r\n"
     "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n"
-    "a=rtpmap:97 rtx/90000\r\n"
-    "a=fmtp:97 apt=96\r\n"
     "a=rtpmap:98 H264/90000\r\n"
-    // "a=rtcp-fb:98 goog-remb\r\n"
-    // "a=rtcp-fb:98 transport-cc\r\n"
-    // "a=rtcp-fb:98 ccm fir\r\n"
     // "a=rtcp-fb:98 nack\r\n"
-    // "a=rtcp-fb:98 nack pli\r\n"
-    // "a=rtcp-fb:98 rrtr\r\n"
-    "a=fmtp:98 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
-    "a=rtpmap:99 rtx/90000\r\n"
-    "a=fmtp:99 apt=98\r\n"
-    "a=rtpmap:100 red/90000\r\n"
-    "a=rtpmap:101 rtx/90000\r\n"
-    "a=fmtp:101 apt=100\r\n"
-    "a=rtpmap:102 ulpfec/90000\r\n";
+    "a=fmtp:98 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
 
 static int webrtc_stream_close(AVFormatContext *h)
 {
@@ -600,7 +568,8 @@ static int is_end_frag(RTPPacket *pkt)
 static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
 {
     if (!rs->buf) {
-        rs->buf_len = 1024;
+        /* TODO: Set buffer size by option */
+        rs->buf_len = 4096;
         rs->buf = av_mallocz(rs->buf_len * sizeof(RTPPacket *));
     }
 
