@@ -597,7 +597,7 @@ static int is_end_frag(RTPPacket *pkt)
 static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
 {
     if (!rs->buf) {
-        rs->buf_len = 4096;
+        rs->buf_len = 1024;
         rs->buf = av_mallocz(rs->buf_len * sizeof(RTPPacket *));
     }
 
@@ -621,16 +621,12 @@ static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
     rs->packet_num++;
     if (rs->packet_num > rs->buf_len) {
         /* Buffer over flow, move seq to new frame */
-        int i = rs->seq; 
+        uint32_t i = rs->seq; 
         while (i - rs->seq < rs->buf_len) {
             RTPPacket *cur = rs->buf[i % rs->buf_len];
             if (cur) {
-                if (is_fragment(cur)) {
-                    if (is_start_frag(cur)) {
-                        rs->seq = cur->seq;
-                        break;
-                    }
-                } else {
+                if (!is_fragment(cur) || is_start_frag(cur)) {
+                    rs->packet_num -= (i - rs->seq);
                     rs->seq = cur->seq;
                     break;
                 }
@@ -642,13 +638,43 @@ static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
     return 0;
 }
 
+static int seq_compare(uint16_t a, uint16_t b)
+{
+#define SEQ_DIST (UINT16_MAX / 2)
+
+    if ((a > b && a - b > SEQ_DIST) ||
+        (a < b && b - a < SEQ_DIST))
+    {
+        return -1;
+    } else if ((a > b && a - b < SEQ_DIST) ||
+               (a < b && b - a > SEQ_DIST))
+    {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
 static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
 {
     int index = rs->seq % rs->buf_len;
     RTPPacket *cur = rs->buf[index], *start = NULL;
+    int last_seq = -1;
 
     while (cur) {
+        if (last_seq != -1 && 
+            cur->seq != (last_seq + 1) % (INT16_MAX + 1)) {
+            /* RTP packet discontinue */
+            break;
+        }
+        last_seq = cur->seq;
+
         if (is_fragment(cur)) {
+            if (start && cur->ts != start->ts) {
+                /* Frame discontinue */
+                break;
+            }
+
             if (is_start_frag(cur)) {
                 start = cur;
             } else if (is_end_frag(cur)) {
@@ -656,7 +682,7 @@ static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
                     uint16_t i = start->seq;
                     uint16_t start_seq = start->seq;
                     uint16_t end_seq = cur->seq;
-                    for (; i <= end_seq; i++) {
+                    for (; seq_compare(i, end_seq) <= 0; i++) {
                         RTPPacket *rtp = rs->buf[i % rs->buf_len];
                         if (i == start_seq) {
                             if (*pkt_list == NULL) {
