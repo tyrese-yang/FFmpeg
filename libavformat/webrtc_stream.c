@@ -108,7 +108,10 @@ const char *OFFER_SDP = "v=0\r\n"
 
 static int webrtc_stream_close(AVFormatContext *h)
 {
-    av_log(h, AV_LOG_INFO, "webrtc_stream_close exit\n");
+    WebrtcStreamContext *ctx = h->priv_data;
+    if (ctx && ctx->thread) {
+        pthread_cancel(ctx->thread);
+    }
     return 0;
 }
 
