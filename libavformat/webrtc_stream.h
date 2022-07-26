@@ -98,6 +98,7 @@ typedef struct WebrtcStreamContext {
 
     char *api;
     Answer *answer;
+    char local_ufrag[9];
 
     URLContext *rtp_hd;
     pthread_t thread;

@@ -12,6 +12,8 @@
 #include "libavutil/intreadwrite.h"
 #include "libavcodec/get_bits.h"
 #include "libavcodec/h264.h"
+#include "libavutil/lfg.h"
+#include "libavutil/random_seed.h"
 
 #include "webrtc_stream.h"
 
@@ -27,47 +29,22 @@
 #define DTS_EXTMAP 10
 #define CTS_EXTMAP 18
 
-const char *OFFER_SDP = "v=0\r\n"
-    "o=- 0 2 IN IP4 127.0.0.1\r\n"
-    "s=-\r\n"
-    "i=ffmpeg\r\n"
-    "t=0 0\r\n"
-    "a=group:BUNDLE 0 1\r\n"
-    "a=extmap-allow-mixed\r\n"
-    "a=msid-semantic: WMS\r\n"
-    "m=audio 9 RTP/AVPF 122\r\n"
-    "c=IN IP4 0.0.0.0\r\n"
-    "a=rtcp:9 IN IP4 0.0.0.0\r\n"
-    "a=ice-ufrag:"LOCAL_ICE_UFRAG"\r\n"
-    "a=ice-pwd:y3yqjhruMPu9GFrOGF/WBN3q\r\n"
-    "a=ice-options:trickle\r\n"
-    "a=mid:0\r\n"
-    "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
-    "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
-    "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
-    "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
-    "a=recvonly\r\n"
-    "a=rtcp-mux\r\n"
-    "a=rtpmap:122 MP4A-ADTS/48000/2\r\n"
-    "a=rtcp-fb:122 transport-cc\r\n"
-    "m=video 9 RTP/AVPF 96\r\n"
-    "c=IN IP4 0.0.0.0\r\n"
-    "a=rtcp:9 IN IP4 0.0.0.0\r\n"
-    "a=ice-ufrag:"LOCAL_ICE_UFRAG"\r\n"
-    "a=ice-pwd:y3yqjhruMPu9GFrOGF/WBN3q\r\n"
-    "a=ice-options:trickle\r\n"
-    "a=mid:1\r\n"
-    "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
-    "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
-    "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
-    "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
-    "a=extmap:18 http://www.webrtc.org/experiments/rtp-hdrext/video-composition-time\r\n"
-    "a=recvonly\r\n"
-    "a=rtcp-mux\r\n"
-    "a=rtcp-rsize\r\n"
-    "a=rtpmap:96 H264/90000\r\n"
-    // "a=rtcp-fb:96 nack\r\n"
-    "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n";
+static int seq_compare(uint16_t a, uint16_t b)
+{
+#define SEQ_DIST (UINT16_MAX / 2)
+
+    if ((a > b && a - b > SEQ_DIST) ||
+        (a < b && b - a < SEQ_DIST))
+    {
+        return -1;
+    } else if ((a > b && a - b < SEQ_DIST) ||
+               (a < b && b - a > SEQ_DIST))
+    {
+        return 1;
+    } else {
+        return 0;
+    }
+}
 
 static int webrtc_stream_close(AVFormatContext *h)
 {
@@ -610,23 +587,6 @@ static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
     return 0;
 }
 
-static int seq_compare(uint16_t a, uint16_t b)
-{
-#define SEQ_DIST (UINT16_MAX / 2)
-
-    if ((a > b && a - b > SEQ_DIST) ||
-        (a < b && b - a < SEQ_DIST))
-    {
-        return -1;
-    } else if ((a > b && a - b < SEQ_DIST) ||
-               (a < b && b - a > SEQ_DIST))
-    {
-        return 1;
-    } else {
-        return 0;
-    }
-}
-
 static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
 {
     int index = rs->read_seq % rs->buf_len;
@@ -965,6 +925,62 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
     return 0;
 }
 
+static char *make_offer(AVFormatContext *s)
+{
+    WebrtcStreamContext *ctx = s->priv_data;
+    AVLFG lfg;
+
+    const char *common_info = "v=0\r\n"
+                              "o=- 0 2 IN IP4 127.0.0.1\r\n"
+                              "s=-\r\n"
+                              "i=ffmpeg\r\n"
+                              "t=0 0\r\n"
+                              "a=group:BUNDLE 0 1\r\n"
+                              "a=extmap-allow-mixed\r\n"
+                              "a=msid-semantic: WMS\r\n";
+
+    const char *ice_info = "a=ice-ufrag:%s\r\n"
+                           "a=ice-pwd:y3yqjhruMPu9GFrOGF/WBN3q\r\n"
+                           "a=ice-options:trickle\r\n";
+    av_lfg_init(&lfg, av_get_random_seed());
+    for (int i = 0; i < sizeof(ctx->local_ufrag) - 1; i++) {
+        ctx->local_ufrag[i] = av_lfg_get(&lfg) % 26 + 'a';
+    }
+    char *ice_str = av_asprintf(ice_info, ctx->local_ufrag);
+
+    const char *audio_media = "m=audio 9 RTP/AVPF 122\r\n"
+                              "c=IN IP4 0.0.0.0\r\n"
+                              "a=rtcp:9 IN IP4 0.0.0.0\r\n"
+                              "a=mid:0\r\n"
+                              "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
+                              "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
+                              "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
+                              "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
+                              "a=recvonly\r\n"
+                              "a=rtcp-mux\r\n"
+                              "a=rtpmap:122 MP4A-ADTS/48000/2\r\n"
+                              "a=rtcp-fb:122 transport-cc\r\n";
+
+    const char *video_media = "m=video 9 RTP/AVPF 96\r\n"
+                              "c=IN IP4 0.0.0.0\r\n"
+                              "a=rtcp:9 IN IP4 0.0.0.0\r\n"
+                              "a=mid:1\r\n"
+                              "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
+                              "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
+                              "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
+                              "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
+                              "a=extmap:18 http://www.webrtc.org/experiments/rtp-hdrext/video-composition-time\r\n"
+                              "a=recvonly\r\n"
+                              "a=rtcp-mux\r\n"
+                              "a=rtcp-rsize\r\n"
+                              "a=rtpmap:96 H264/90000\r\n"
+                              "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n";
+
+    char *sdp = av_asprintf("%s%s%s%s", common_info, ice_str, audio_media, video_media);
+    av_free(ice_str);
+    return sdp;
+}
+
 static int webrtc_stream_read_header(AVFormatContext *s)
 {
     int ret = 0;
@@ -984,12 +1000,18 @@ static int webrtc_stream_read_header(AVFormatContext *s)
     c->answer = av_mallocz(sizeof(Answer));
     ans = c->answer;
 
-    if ((ret = send_offer(&h, s, c->api, OFFER_SDP)) < 0) {
+    char *offer_sdp = make_offer(s);
+    if (!offer_sdp) {
+        av_log(s, AV_LOG_ERROR, "Make offer failed\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if ((ret = send_offer(&h, s, c->api, offer_sdp)) < 0) {
         av_log(s, AV_LOG_ERROR, "Send offer failed\n");
         ffurl_close(h);
         return ret;
     }
-    av_log(s, AV_LOG_DEBUG, "Send offer %s to %s\n", OFFER_SDP, c->api);
+    av_log(s, AV_LOG_DEBUG, "Send offer %s to %s\n", offer_sdp, c->api);
 
     while (n < buf_size) {
         int ret = ffurl_read(h, buf + n, buf_size - n);
@@ -1008,13 +1030,15 @@ static int webrtc_stream_read_header(AVFormatContext *s)
 
     create_streams_from_sdp(s, &ans->sdp);
 
-    username = av_asprintf("%s:%s", ans->sdp.ice_ufrag, LOCAL_ICE_UFRAG);
-    if ((ret = webrtc_connect(s, &ans->sdp.candidate, username) != 0)) {
+    username = av_asprintf("%s:%s", ans->sdp.ice_ufrag, c->local_ufrag);
+    ret = webrtc_connect(s, &ans->sdp.candidate, username);
+    if (ret != 0) {
         av_log(s, AV_LOG_ERROR, "Webrtc connect failed\n");
         av_free(username);
         return ret;
     }
     av_free(username);
+    av_free(offer_sdp);
     return ret;
 }
 
