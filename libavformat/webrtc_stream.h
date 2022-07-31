@@ -7,7 +7,7 @@
 
 typedef struct RTPPacket {
     uint8_t pt;
-    volatile uint16_t seq;
+    uint16_t seq;
     uint32_t ts;
     uint8_t *playload;
     int playload_size;
@@ -88,10 +88,9 @@ typedef struct RTPStream {
 
     RTPPacket **buf;
     int buf_len;
-    int packet_num;
     uint16_t read_seq;
     volatile uint16_t write_seq;
-    int init;
+    int inited;
 
     AVPacket *pend;
 } RTPStream;

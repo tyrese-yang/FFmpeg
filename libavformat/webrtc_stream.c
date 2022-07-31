@@ -571,47 +571,32 @@ static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
         rs->buf = av_mallocz(rs->buf_len * sizeof(RTPPacket *));
     }
 
-    int index = pkt->seq % rs->buf_len;
+    uint16_t index = pkt->seq % rs->buf_len;
     if (rs->buf[index]) {
         if (rs->buf[index]->seq == pkt->seq) {
             av_log(NULL, AV_LOG_INFO, "Duplicated packet, seq=%u\n", pkt->seq);
-            rtp_packet_free(pkt);
-            return 0;
+            return -1;
         }
         av_log(NULL, AV_LOG_INFO, "Cover buffer, old-seq=%u seq=%u\n", rs->buf[index]->seq, pkt->seq);
         rtp_packet_free(rs->buf[index]);
     }
 
+    if (rs->inited && seq_compare(rs->read_seq, pkt->seq) > 0) {
+        av_log(NULL, AV_LOG_INFO, "RTP packet expired, seq=%u read-seq=%u\n", rs->read_seq, pkt->seq);
+        return -1;
+    }
+
     rs->buf[index] = pkt;
-    if (rs->packet_num > 0 && pkt->seq != rs->write_seq + 1) {
+    if (rs->inited && pkt->seq != rs->write_seq + 1) {
         av_log(NULL, AV_LOG_INFO, "RTP packet write discontinuous, last-seq=%u cur-seq=%u\n",
                rs->write_seq, pkt->seq);
     }
     rs->write_seq = pkt->seq;
 
-    if (rs->init == 0) {
+    if (rs->inited == 0) {
         rs->read_seq = pkt->seq;
-        rs->init = 1;
+        rs->inited = 1;
     }
-
-    rs->packet_num++;
-    if (rs->packet_num > rs->buf_len) {
-        /* Buffer over flow, move seq to new frame */
-        av_log(NULL, AV_LOG_INFO, "Buffer over flow, packet-num=%u\n", rs->packet_num);
-        uint32_t i = rs->read_seq; 
-        while (i - rs->read_seq < rs->buf_len) {
-            RTPPacket *cur = rs->buf[i % rs->buf_len];
-            if (cur) {
-                if (!is_fragment(cur) || is_start_frag(cur)) {
-                    rs->packet_num -= (i - rs->read_seq);
-                    rs->read_seq = cur->seq;
-                    break;
-                }
-            }
-            i++;
-        }
-    }
-
     return 0;
 }
 
@@ -620,6 +605,22 @@ static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
     int index = rs->read_seq % rs->buf_len;
     RTPPacket *cur = rs->buf[index], *start = NULL;
     int last_seq = -1;
+
+    if (cur && rs->read_seq != rs->buf[index]->seq) {
+        av_log(NULL, AV_LOG_INFO, "Buffer may be over flow, origin-seq=%u current-seq=%u\n",
+               rs->read_seq, rs->buf[index]->seq);
+        /* Move seq to new frame */
+        for (uint32_t i = rs->read_seq; i - rs->read_seq < rs->buf_len; i++) {
+            RTPPacket *p = rs->buf[i % rs->buf_len];
+            if (p) {
+                if (!is_fragment(p) || is_start_frag(p)) {
+                    rs->read_seq = p->seq;
+                    cur = p;
+                    break;
+                }
+            }
+        }
+    }
 
     while (cur) {
         if (last_seq != -1 && 
@@ -632,19 +633,22 @@ static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
 
         if (is_fragment(cur)) {
             if (start && cur->ts != start->ts) {
-                av_log(NULL, AV_LOG_INFO, "Frame discontinue, start-ts=%u cur-ts=%u\n", start->ts, cur->ts);
-                break;
+                av_log(NULL, AV_LOG_INFO, "Frame timestamp discontinue, start-ts=%u cur-ts=%u\n", start->ts, cur->ts);
+                start = NULL;
             }
 
             if (is_start_frag(cur)) {
+                if (start) {
+                    av_log(NULL, AV_LOG_INFO, "Miss end frag, start-ts=%u cur-ts=%u\n", start->ts, cur->ts);
+                }
                 start = cur;
             } else if (is_end_frag(cur)) {
                 if (start) {
-                    uint16_t i = start->seq;
                     uint16_t start_seq = start->seq;
                     uint16_t end_seq = cur->seq;
-                    for (; seq_compare(i, end_seq) <= 0; i++) {
+                    for (uint16_t i = start_seq; seq_compare(i, end_seq) <= 0; i++) {
                         RTPPacket *rtp = rs->buf[i % rs->buf_len];
+                        rs->buf[i % rs->buf_len] = NULL;
                         if (i == start_seq) {
                             if (*pkt_list == NULL) {
                                 *pkt_list = av_mallocz(sizeof(PacketList));
@@ -659,11 +663,10 @@ static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
                         } else {
                             h264_handle_packet_fu_a(&(*pkt_list)->pkt, rtp->playload, rtp->playload_size);
                         }
+
                         rtp_packet_free(rtp);
-                        rs->buf[i % rs->buf_len] = NULL;
-                        rs->packet_num--;
                     }
-                    rs->read_seq = i;
+                    rs->read_seq = end_seq + 1;
                     start = NULL;
                 }
             }
@@ -671,7 +674,6 @@ static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
             if (start) {
                 /* Break fragment */
                 av_log(NULL, AV_LOG_INFO, "Break fragment, start-seq=%u\n", start->seq);
-                break;
             }
 
             if (*pkt_list == NULL) {
@@ -680,7 +682,6 @@ static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
                 (*pkt_list)->next = av_mallocz(sizeof(PacketList));
                 *pkt_list = (*pkt_list)->next;
             }
-
             av_new_packet(&(*pkt_list)->pkt, cur->playload_size + sizeof(start_sequence));
             memcpy((*pkt_list)->pkt.data, start_sequence, sizeof(start_sequence));
             memcpy((*pkt_list)->pkt.data + sizeof(start_sequence), cur->playload, cur->playload_size);
@@ -688,10 +689,10 @@ static int read_avpackets_from_buffer(RTPStream *rs, PacketList **pkt_list)
             (*pkt_list)->pkt.pts = cur->ext_dts + cur->ext_cts;
             (*pkt_list)->pkt.flags |= AV_PKT_FLAG_KEY;
             (*pkt_list)->pkt.stream_index = rs->stream_index;
+
             rs->read_seq = cur->seq + 1;
             rs->buf[cur->seq % rs->buf_len] = NULL;
             rtp_packet_free(cur);
-            rs->packet_num--;
         }
 
         index++;
@@ -801,7 +802,9 @@ static void *read_rtp_thread(void *arg)
                 pkt->stream_index = rs->stream_index;
                 queue_put(&ctx->queue, pkt);
             } else if (rs->type == AVMEDIA_TYPE_VIDEO) {
-                write_rtp_packet_to_buffer(rs, rtp_pkt);
+                if (write_rtp_packet_to_buffer(rs, rtp_pkt) < 0) {
+                    rtp_packet_free(rtp_pkt);
+                }
                 PacketList *pkt_list = NULL;
                 read_avpackets_from_buffer(rs, &pkt_list);
                 while (pkt_list) {
