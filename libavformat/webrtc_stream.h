@@ -6,10 +6,12 @@
 #include "stun.h"
 
 typedef struct RTPPacket {
+    uint8_t pt;
     volatile uint16_t seq;
     uint32_t ts;
     uint8_t *playload;
     int playload_size;
+    uint32_t ssrc;
 
     /* Extend data */
     uint32_t ext_dts;
@@ -40,6 +42,7 @@ typedef struct Candidate {
 typedef struct RTPMedia {
     int pt;
     enum AVMediaType type;
+    uint32_t ssrc;
 
     // Audio info
     int channel;
@@ -81,6 +84,7 @@ typedef struct RTPStream {
     uint8_t pt;
     enum AVMediaType type;
     int stream_index;
+    uint32_t ssrc;
 
     RTPPacket **buf;
     int buf_len;

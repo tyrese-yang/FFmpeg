@@ -46,6 +46,31 @@ static int seq_compare(uint16_t a, uint16_t b)
     }
 }
 
+static void get_word_until_chars(char *buf, int buf_size,
+                                 const char *sep, const char **pp)
+{
+    const char *p;
+    char *q;
+
+    p = *pp;
+    p += strspn(p, SPACE_CHARS);
+    q = buf;
+    while (!strchr(sep, *p) && *p != '\0') {
+        if ((q - buf) < buf_size - 1)
+            *q++ = *p;
+        p++;
+    }
+    if (buf_size > 0)
+        *q = '\0';
+    *pp = p;
+}
+
+static void get_word(char *buf, int buf_size, const char **pp)
+{
+    get_word_until_chars(buf, buf_size, SPACE_CHARS, pp);
+}
+
+
 static int webrtc_stream_close(AVFormatContext *h)
 {
     WebrtcStreamContext *ctx = h->priv_data;
@@ -338,6 +363,9 @@ static int parse_attr(SDP *sdp, const char *data, int len)
                 break;
             }
         }
+    } else if (av_strstart(line, "ssrc:", &v)) {
+        get_word(buf, sizeof(buf), &v);
+        sdp->medias[sdp->nb_medias - 1]->ssrc = strtoll(buf, NULL, 10);
     }
 
     return 0;
@@ -676,31 +704,33 @@ static int parse_rtp(uint8_t *buf, int size, RTPPacket *pkt)
 {
     int cc = buf[0] & 0x0f;
     int ext = buf[0] & 0x10;
-    pkt->seq = AV_RB16(buf+2);
-    pkt->ts = AV_RB32(buf+4);
+    pkt->pt = buf[1] & 0x7f;
+    pkt->seq = AV_RB16(buf + 2);
+    pkt->ts = AV_RB32(buf + 4);
+    pkt->ssrc = AV_RB32(buf + 8);
     int pos = 12 + cc * 4;
     if (ext) {
-        if ((buf[pos] == 0xbe) && (buf[pos+1] == 0xde)) {
+        if ((buf[pos] == 0xbe) && (buf[pos + 1] == 0xde)) {
             /* One-byte extension */
             pos += 2;
-            int len = (buf[pos] << 8) | buf[pos+1];
+            int len = (buf[pos] << 8) | buf[pos + 1];
             pos += 2;
             for (int i = 0; i < len * 4;) {
                 if (buf[pos+i] == 0) {
                     i++;
                     continue;
                 }
-                int id = (buf[pos+i] >> 4) & 0x0f;
-                int l = buf[pos+i] & 0x0f;
+                int id = (buf[pos + i] >> 4) & 0x0f;
+                int l = buf[pos + i] & 0x0f;
                 switch (id) {
                 case DTS_EXTMAP:
                     for (int j = 0; j < l+1; j++) {
-                        pkt->ext_dts = (buf[pos+i+1+j] << (8 * (l-j))) | pkt->ext_dts;
+                        pkt->ext_dts = (buf[pos + i + 1 + j] << (8 * (l - j))) | pkt->ext_dts;
                     }
                     break;
                 case CTS_EXTMAP:
-                    for (int j = 0; j < l+1; j++) {
-                        pkt->ext_cts = (buf[pos+i+1+j] << (8 * (l-j))) | pkt->ext_cts;
+                    for (int j = 0; j < l + 1; j++) {
+                        pkt->ext_cts = (buf[pos + i + 1 + j] << (8 * (l - j))) | pkt->ext_cts;
                     }
                     break;
                 default:
@@ -709,23 +739,23 @@ static int parse_rtp(uint8_t *buf, int size, RTPPacket *pkt)
                 i += 1 + l + 1;
             }
             pos += len * 4;
-        } else if ((buf[pos] == 0x10) && (((buf[pos+1] >> 4) & 0x0f) == 0)) {
+        } else if ((buf[pos] == 0x10) && (((buf[pos + 1] >> 4) & 0x0f) == 0)) {
             /* Two-byte extension */
             pos += 2;
-            int len = buf[pos] << 8 | buf[pos+1];
+            int len = buf[pos] << 8 | buf[pos + 1];
             pos += 2;
-            for (int i = 0; i < len*4;) {
-                int id = buf[pos+i];
-                int l = buf[pos+i+1];
+            for (int i = 0; i < len * 4;) {
+                int id = buf[pos + i];
+                int l = buf[pos + i + 1];
                 switch (id) {
                 case DTS_EXTMAP:
                     for (int j = 0; j < l; j++) {
-                        pkt->ext_dts = (buf[pos+i+2+j] << (8 * (l-j-1))) | pkt->ext_dts;
+                        pkt->ext_dts = (buf[pos + i + 2 + j] << (8 * (l - j - 1))) | pkt->ext_dts;
                     }
                     break;
                 case CTS_EXTMAP:
                     for (int j = 0; j < l; j++) {
-                        pkt->ext_cts = (buf[pos+i+2+j] << (8 * (l-j-1))) | pkt->ext_cts;
+                        pkt->ext_cts = (buf[pos + i + 2 + j] << (8 * (l - j - 1))) | pkt->ext_cts;
                     }
                     break;
                 default:
@@ -753,14 +783,14 @@ static void *read_rtp_thread(void *arg)
         ret = ffurl_read(ctx->rtp_hd, buf, sizeof(buf));
         int size = ret;
         if (is_rtp(buf, size)) {
-            uint8_t pt = buf[1] & 0x7f;
-            RTPStream *rs = rtp_stream_get(ctx, pt);
-            if (!rs) {
+            RTPPacket *rtp_pkt = rtp_packet_alloc();
+            parse_rtp(buf, size, rtp_pkt);
+            RTPStream *rs = rtp_stream_get(ctx, rtp_pkt->pt);
+            if (!rs || rs->ssrc != rtp_pkt->ssrc) {
+                rtp_packet_free(rtp_pkt);
                 continue;
             }
 
-            RTPPacket *rtp_pkt = rtp_packet_alloc();
-            parse_rtp(buf, size, rtp_pkt);
             if (rs->type == AVMEDIA_TYPE_AUDIO) {
                 AVPacket *pkt = av_packet_alloc();
                 av_new_packet(pkt, rtp_pkt->playload_size);
@@ -900,6 +930,7 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             rs->stream_index = st->index;
             rs->pt = m->pt;
             rs->type = m->type;
+            rs->ssrc = m->ssrc;
 
             av_log(s, AV_LOG_DEBUG, "Media channels=%d sample_rate=%d extradata=%s extradata_size=%d\n",
                 st->codecpar->channels, st->codecpar->sample_rate,
@@ -916,6 +947,7 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             rs->stream_index = st->index;
             rs->pt = m->pt;
             rs->type = m->type;
+            rs->ssrc = m->ssrc;
             break;
         }
         default:
