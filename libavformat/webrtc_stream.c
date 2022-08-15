@@ -75,7 +75,6 @@ static void get_word(char *buf, int buf_size, const char **pp)
     get_word_until_chars(buf, buf_size, SPACE_CHARS, pp);
 }
 
-
 static int webrtc_stream_close(AVFormatContext *h)
 {
     WebrtcStreamContext *ctx = h->priv_data;
@@ -254,18 +253,6 @@ static int send_offer(URLContext **puc, AVFormatContext *s, const char* api,
     return ffurl_connect(*puc, NULL);
 }
 
-static char *read_line_arg(char *buf, int buf_size, const char *data, const char *split)
-{
-    char *next = av_stristr(data, split);
-    if (buf) {
-        if (next)
-            memcpy(buf, data, next - data > buf_size ? buf_size : next - data);
-        else
-            strncpy(buf, data, buf_size);
-    }
-    return next ? next + 1 : NULL;
-}
-
 static int parse_attr(SDP *sdp, const char *data, int len)
 {
     const char *v = NULL;
@@ -283,18 +270,15 @@ static int parse_attr(SDP *sdp, const char *data, int len)
             sscanf(v, "%*s %*d %*s %*d %s %hd %*s", sdp->candidate.ip, &sdp->candidate.port);
     } else if (av_strstart(line, "fmtp:", &v)) {
         // a=fmtp:123 PS-enabled=0;SBR-enabled=0;config=40002420adca1fe0;cpresent=0;object=2;profile-level-id=1;stereo=1
-        int l = av_stristr(v, " ") - v;
-        memcpy(buf, v, l);
+        get_word(buf, sizeof(buf), &v);
         int pt = atoi(buf);
         RTPMedia *m = rtp_media_get(sdp, pt);
         if (m) {
             switch (m->type) {
             case AVMEDIA_TYPE_AUDIO: {
-                v += l + 1;
-                const char *next = v;
-                while(next) {
-                    memset(buf, 0, sizeof(buf));
-                    next = read_line_arg(buf, sizeof(buf), next, ";");
+                while(*v != '\0') {
+                    v++;
+                    get_word_until_chars(buf, sizeof(buf), ";", &v);
                     const char *vv;
                     if (av_stristart(buf, "PS-enabled=", &vv)) {
                         m->ps = atoi(vv);
@@ -311,11 +295,9 @@ static int parse_attr(SDP *sdp, const char *data, int len)
                 break;
             }
             case AVMEDIA_TYPE_VIDEO:{
-                v += l + 1;
-                const char *next = v;
-                while(next) {
-                    memset(buf, 0, sizeof(buf));
-                    next = read_line_arg(buf, sizeof(buf), next, ";");
+                while(*v != '\0') {
+                    v++;
+                    get_word_until_chars(buf, sizeof(buf), ";", &v);
                     const char *vv;
                     if (av_stristart(buf, "bframe-enabled=", &vv)) {
                         m->bframe_enabled = atoi(vv);
@@ -335,32 +317,22 @@ static int parse_attr(SDP *sdp, const char *data, int len)
         }
     } else if (av_strstart(line, "rtpmap:", &v)) {
         // a=rtpmap:123 MP4A-ADTS/44100/2
-        int l = 0;
-        l = av_stristr(v, " ") - v;
-        memcpy(buf, v, l);
+        get_word(buf, sizeof(buf), &v);
         int pt = atoi(buf);
         RTPMedia *m = rtp_media_get(sdp, pt);
         if (m) {
             switch (m->type) {
             case AVMEDIA_TYPE_AUDIO:
-                v += l+1;
                 // skip type
                 // TODO: check type
                 v = av_stristr(v, "/") + 1;
 
-                l = av_stristr(v, "/") - v;
-                memset(buf, 0, sizeof(buf));
-                memcpy(buf, v, l);
-                int sample_rate = atoi(buf);
+                get_word_until_chars(buf, sizeof(buf), "/", &v);
+                m->sample_rate  = atoi(buf);
 
-                v += l+1;
-                l = len - (v-line);
-                memset(buf, 0, sizeof(buf));
-                memcpy(buf, v, l);
-                int channel = atoi(buf);
-
-                m->channel = channel;
-                m->sample_rate = sample_rate;
+                v++;
+                get_word_until_chars(buf, sizeof(buf), "/", &v);
+                m->channel = atoi(buf);
                 break;
             case AVMEDIA_TYPE_VIDEO:
                 break;
@@ -379,31 +351,30 @@ static int parse_attr(SDP *sdp, const char *data, int len)
 static int parse_mline(SDP *sdp, const char *data, int len)
 {
     char line[1024] = {0};
-    memcpy(line, data, len);
+    const char *v;
+    char buf[8] = {0};
 
+    memcpy(line, data, len);
+    v = line;
     if (av_strstart(line, "audio", NULL)) {
         // m=audio 1 RTP/AVPF 123
-        char *next = read_line_arg(NULL, 0, line, " ");
-        if (next)
-            next = read_line_arg(NULL, 0, next, " ");
-        if (next)
-            next = read_line_arg(NULL, 0, next, " ");
-        while (next) {
-            char buf[8] = {0};
-            next = read_line_arg(buf, sizeof(buf), next, " ");
+        get_word(buf, sizeof(buf), &v);
+        get_word(buf, sizeof(buf), &v);
+        get_word(buf, sizeof(buf), &v);
+        while (*v != '\0') {
+            v++;
+            get_word(buf, sizeof(buf), &v);
             RTPMedia *m = rtp_media_create(sdp);
             m->pt = atoi(buf);
             m->type = AVMEDIA_TYPE_AUDIO;
         }
     } else if (av_strstart(line, "video", NULL)) {
-        char *next = read_line_arg(NULL, 0, line, " ");
-        if (next)
-            next = read_line_arg(NULL, 0, next, " ");
-        if (next)
-            next = read_line_arg(NULL, 0, next, " ");
-        while (next) {
-            char buf[8] = {0};
-            next = read_line_arg(buf, sizeof(buf), next, " ");
+        get_word(buf, sizeof(buf), &v);
+        get_word(buf, sizeof(buf), &v);
+        get_word(buf, sizeof(buf), &v);
+        while (*v != '\0') {
+            v++;
+            get_word(buf, sizeof(buf), &v);
             RTPMedia *m = rtp_media_create(sdp);
             m->pt = atoi(buf);
             m->type = AVMEDIA_TYPE_VIDEO;
@@ -1106,36 +1077,36 @@ static char *make_offer(AVFormatContext *s)
     }
 
     const char *am_fmt = "m=audio 9 RTP/AVPF 122\r\n"
-                              "c=IN IP4 0.0.0.0\r\n"
-                              "a=rtcp:9 IN IP4 0.0.0.0\r\n"
-                              "a=mid:0\r\n"
-                              "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
-                              "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
-                              "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
-                              "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
-                              "a=recvonly\r\n"
-                              "a=rtcp-mux\r\n"
-                              "a=rtpmap:122 MP4A-ADTS/48000/2\r\n"
-                              "a=rtcp-fb:122 nack\r\n"
-                              "a=ssrc:%u cname:%s\r\n";
+                         "c=IN IP4 0.0.0.0\r\n"
+                         "a=rtcp:9 IN IP4 0.0.0.0\r\n"
+                         "a=mid:0\r\n"
+                         "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
+                         "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
+                         "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
+                         "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
+                         "a=recvonly\r\n"
+                         "a=rtcp-mux\r\n"
+                         "a=rtpmap:122 MP4A-ADTS/48000/2\r\n"
+                         "a=rtcp-fb:122 nack\r\n"
+                         "a=ssrc:%u cname:%s\r\n";
     char *am_str = av_asprintf(am_fmt, ctx->audio_ssrc, cname);
 
     const char *vm_fmt = "m=video 9 RTP/AVPF 96\r\n"
-                              "c=IN IP4 0.0.0.0\r\n"
-                              "a=rtcp:9 IN IP4 0.0.0.0\r\n"
-                              "a=mid:1\r\n"
-                              "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
-                              "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
-                              "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
-                              "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
-                              "a=extmap:18 http://www.webrtc.org/experiments/rtp-hdrext/video-composition-time\r\n"
-                              "a=recvonly\r\n"
-                              "a=rtcp-mux\r\n"
-                              "a=rtcp-rsize\r\n"
-                              "a=rtpmap:96 H264/90000\r\n"
-                              "a=rtcp-fb:96 nack\r\n"
-                              "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n"
-                              "a=ssrc:%u cname:%s\r\n";
+                         "c=IN IP4 0.0.0.0\r\n"
+                         "a=rtcp:9 IN IP4 0.0.0.0\r\n"
+                         "a=mid:1\r\n"
+                         "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-01\r\n"
+                         "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-02\r\n"
+                         "a=extmap:9 http://www.webrtc.org/experiments/rtp-hdrext/meta-data-03\r\n"
+                         "a=extmap:10 http://www.webrtc.org/experiments/rtp-hdrext/decoding-timestamp\r\n"
+                         "a=extmap:18 http://www.webrtc.org/experiments/rtp-hdrext/video-composition-time\r\n"
+                         "a=recvonly\r\n"
+                         "a=rtcp-mux\r\n"
+                         "a=rtcp-rsize\r\n"
+                         "a=rtpmap:96 H264/90000\r\n"
+                         "a=rtcp-fb:96 nack\r\n"
+                         "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n"
+                         "a=ssrc:%u cname:%s\r\n";
     char *vm_str = av_asprintf(vm_fmt, ctx->video_ssrc, cname);
 
     char *sdp = av_asprintf("%s%s%s%s", common_info, ice_str, am_str, vm_str);
