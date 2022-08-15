@@ -29,6 +29,11 @@
 #define DTS_EXTMAP 10
 #define CTS_EXTMAP 18
 
+#define NACK_INTERVAL_LIMIT 20 // ms
+
+#define BASE_NACK 0
+#define OFFSET_NACK 1
+
 static int seq_compare(uint16_t a, uint16_t b)
 {
 #define SEQ_DIST (UINT16_MAX / 2)
@@ -563,6 +568,102 @@ static int is_end_frag(RTPPacket *pkt)
     return end_bit;
 }
 
+static void delete_nack(RTPStream *rs, uint16_t seq)
+{
+    for (NackList *ln = rs->first_nack; ln; ) {
+        if (ln == rs->first_nack && ln->seq == seq) {
+            NackList *tmp = rs->first_nack;
+            if (rs->last_nack == rs->first_nack) {
+                rs->first_nack = NULL;
+                rs->last_nack = NULL;
+            } else {
+                rs->first_nack = rs->first_nack->next;
+            }
+            av_free(tmp);
+            rs->nack_list_size--;
+            break;
+        }
+
+        if (ln->next == NULL) {
+            break;
+        }
+
+        if (ln->next->seq == seq) {
+            NackList *tmp = ln->next;
+            if (ln->next == rs->last_nack) {
+                rs->last_nack = ln;
+            }
+            ln->next = ln->next->next;
+            av_free(tmp);
+            rs->nack_list_size--;
+            break;
+        }
+
+        if (ln->next->next == NULL) {
+            break;
+        }
+
+        ln = ln->next;
+    }
+}
+
+static void add_nack(RTPStream *rs, uint16_t seq)
+{
+    /* TODO: limit nack list size */
+    NackList* nack = av_mallocz(sizeof(NackList));
+    nack->seq = seq;
+    if (rs->last_nack) {
+        rs->last_nack->next = nack;
+        rs->last_nack = nack;
+    } else {
+        rs->first_nack = nack;
+        rs->last_nack = nack;
+    }
+    rs->nack_list_size++;
+}
+
+static int send_nack(WebrtcStreamContext *ctx, RTPStream *rs)
+{
+    if (rs->nack_list_size == 0) {
+        return 0;
+    }
+
+    /* TODO:
+        1. fragment large nack message
+        2. limit nack range */
+    uint8_t *nack_pkt = av_mallocz(12);
+    uint16_t len = 12;
+    nack_pkt[0] = 0x02 << 6 | 0x01;
+    nack_pkt[1] = 205;
+    AV_WB32(nack_pkt + 4, rs->receiver_ssrc);
+    AV_WB32(nack_pkt + 8, rs->ssrc);
+
+    uint32_t pid, blp = 0;
+    for (uint16_t i = rs->first_nack->seq; ; i++) {
+        if (blp == 0) {
+            pid = i;
+            blp = 1;
+        }
+        blp |= 1 << (i - pid);
+
+        if (i == rs->last_nack->seq || i < pid || i - pid > 15) {
+            len += 4;
+            nack_pkt = av_realloc(nack_pkt, len);
+            AV_WB16(nack_pkt + len - 4, pid);
+            AV_WB16(nack_pkt + len - 2, blp);
+            blp = 0;
+            if (i == rs->last_nack->seq)
+                break;
+        }
+    }
+
+    AV_WB16(nack_pkt + 2, len / 4 - 1);
+    ffurl_write(ctx->rtp_hd, nack_pkt, len);
+    av_log(NULL, AV_LOG_INFO, "Send nack, loss=%d size=%u\n", rs->nack_list_size, len);
+    av_free(nack_pkt);
+    return 0;
+}
+
 static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
 {
     if (!rs->buf) {
@@ -581,15 +682,21 @@ static int write_rtp_packet_to_buffer(RTPStream *rs, RTPPacket *pkt)
         rtp_packet_free(rs->buf[index]);
     }
 
+    delete_nack(rs, pkt->seq);
+
     if (rs->inited && seq_compare(rs->read_seq, pkt->seq) > 0) {
-        av_log(NULL, AV_LOG_INFO, "RTP packet expired, seq=%u read-seq=%u\n", rs->read_seq, pkt->seq);
+        av_log(NULL, AV_LOG_INFO, "RTP packet expired, read-seq=%u seq=%u\n", rs->read_seq, pkt->seq);
         return -1;
     }
 
     rs->buf[index] = pkt;
-    if (rs->inited && pkt->seq != rs->write_seq + 1) {
+    if (rs->inited && seq_compare(pkt->seq, rs->write_seq + 1) > 0) {
         av_log(NULL, AV_LOG_INFO, "RTP packet write discontinuous, last-seq=%u cur-seq=%u\n",
                rs->write_seq, pkt->seq);
+
+        for (uint16_t i = rs->write_seq + 1; i != pkt->seq; i++) {
+            add_nack(rs, i);
+        }
     }
     rs->write_seq = pkt->seq;
 
@@ -779,8 +886,10 @@ static void *read_rtp_thread(void *arg)
     WebrtcStreamContext *ctx = arg;
     int ret = 0;
     uint8_t buf[2048];
+    int64_t cur;
 
     for(;;) {
+        cur = av_gettime();
         ret = ffurl_read(ctx->rtp_hd, buf, sizeof(buf));
         int size = ret;
         if (is_rtp(buf, size)) {
@@ -813,11 +922,15 @@ static void *read_rtp_thread(void *arg)
                     pkt_list = pkt_list->next;
                 }
             }
+
+            if (cur - rs->last_nack_time >= NACK_INTERVAL_LIMIT * 1000) {
+                send_nack(ctx, rs);
+                rs->last_nack_time = cur;
+            }
         } else if (is_rtcp(buf, size)) {
             /* TODO: Handle rtcp packet */
         }
 
-        int64_t cur = av_gettime();
         if (cur - ctx->last_bind_req_time > STUN_BINDING_INTERVAL * 1000) {
             uint8_t buf[256] = {0};
             int n = stun_write(buf, 256, ctx->stun_bind_req, STUN_BINDING_PASSWORD);
@@ -934,6 +1047,7 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             rs->pt = m->pt;
             rs->type = m->type;
             rs->ssrc = m->ssrc;
+            rs->receiver_ssrc = ctx->audio_ssrc;
 
             av_log(s, AV_LOG_DEBUG, "Media channels=%d sample_rate=%d extradata=%s extradata_size=%d\n",
                 st->codecpar->channels, st->codecpar->sample_rate,
@@ -951,6 +1065,7 @@ static int create_streams_from_sdp(AVFormatContext *s, const SDP *sdp)
             rs->pt = m->pt;
             rs->type = m->type;
             rs->ssrc = m->ssrc;
+            rs->receiver_ssrc = ctx->video_ssrc;
             break;
         }
         default:
@@ -983,7 +1098,14 @@ static char *make_offer(AVFormatContext *s)
     }
     char *ice_str = av_asprintf(ice_info, ctx->local_ufrag);
 
-    const char *audio_media = "m=audio 9 RTP/AVPF 122\r\n"
+    ctx->audio_ssrc = av_lfg_get(&lfg);
+    ctx->video_ssrc = av_lfg_get(&lfg);
+    char cname[9] = {0};
+    for (int i = 0; i < sizeof(cname) - 1; i++) {
+        cname[i] = av_lfg_get(&lfg) % 26 + 'a';
+    }
+
+    const char *am_fmt = "m=audio 9 RTP/AVPF 122\r\n"
                               "c=IN IP4 0.0.0.0\r\n"
                               "a=rtcp:9 IN IP4 0.0.0.0\r\n"
                               "a=mid:0\r\n"
@@ -994,9 +1116,11 @@ static char *make_offer(AVFormatContext *s)
                               "a=recvonly\r\n"
                               "a=rtcp-mux\r\n"
                               "a=rtpmap:122 MP4A-ADTS/48000/2\r\n"
-                              "a=rtcp-fb:122 transport-cc\r\n";
+                              "a=rtcp-fb:122 nack\r\n"
+                              "a=ssrc:%u cname:%s\r\n";
+    char *am_str = av_asprintf(am_fmt, ctx->audio_ssrc, cname);
 
-    const char *video_media = "m=video 9 RTP/AVPF 96\r\n"
+    const char *vm_fmt = "m=video 9 RTP/AVPF 96\r\n"
                               "c=IN IP4 0.0.0.0\r\n"
                               "a=rtcp:9 IN IP4 0.0.0.0\r\n"
                               "a=mid:1\r\n"
@@ -1009,10 +1133,15 @@ static char *make_offer(AVFormatContext *s)
                               "a=rtcp-mux\r\n"
                               "a=rtcp-rsize\r\n"
                               "a=rtpmap:96 H264/90000\r\n"
-                              "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n";
+                              "a=rtcp-fb:96 nack\r\n"
+                              "a=fmtp:96 bframe-enabled=1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n"
+                              "a=ssrc:%u cname:%s\r\n";
+    char *vm_str = av_asprintf(vm_fmt, ctx->video_ssrc, cname);
 
-    char *sdp = av_asprintf("%s%s%s%s", common_info, ice_str, audio_media, video_media);
+    char *sdp = av_asprintf("%s%s%s%s", common_info, ice_str, am_str, vm_str);
     av_free(ice_str);
+    av_free(am_str);
+    av_free(vm_str);
     return sdp;
 }
 

@@ -5,7 +5,7 @@
 
 #include "stun.h"
 
-typedef struct RTPPacket {
+typedef struct {
     uint8_t pt;
     uint16_t seq;
     uint32_t ts;
@@ -17,6 +17,11 @@ typedef struct RTPPacket {
     uint32_t ext_dts;
     uint32_t ext_cts;
 } RTPPacket;
+
+typedef struct NackList {
+    uint16_t seq;
+    struct NackList *next;
+} NackList;
 
 typedef struct PacketList {
     struct PacketList *next;
@@ -85,12 +90,17 @@ typedef struct RTPStream {
     enum AVMediaType type;
     int stream_index;
     uint32_t ssrc;
+    uint32_t receiver_ssrc;
 
     RTPPacket **buf;
     int buf_len;
     uint16_t read_seq;
-    volatile uint16_t write_seq;
+    uint16_t write_seq;
     int inited;
+
+    NackList *first_nack, *last_nack;
+    int nack_list_size;
+    int64_t last_nack_time;
 
     AVPacket *pend;
 } RTPStream;
@@ -113,5 +123,8 @@ typedef struct WebrtcStreamContext {
 
     RTPStream **rtp_streams;
     int nb_rtp_streams;
+
+    uint32_t video_ssrc;
+    uint32_t audio_ssrc;
 } WebrtcStreamContext;
 #endif // WEBRTC_STREAM_H

@@ -114,10 +114,6 @@ int stun_write(void *buf, size_t size, const stun_message_t *msg, const char *pa
 	uint8_t *begin = buf;
 	uint8_t *pos = begin;
 	uint8_t *end = begin + size;
-
-	av_log(NULL, AV_LOG_DEBUG, "Writing STUN message, class=0x%X, method=0x%X\n", (unsigned int)msg->msg_class,
-	             (unsigned int)msg->msg_method);
-
 	size_t len =
 	    stun_write_header(pos, end - pos, msg->msg_class, msg->msg_method, msg->transaction_id);
 	if (len <= 0)
